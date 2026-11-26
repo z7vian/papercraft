@@ -1,0 +1,13 @@
+/core/target/
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.kotlin/
+.idea/
+*.iml
+/android/captures/
+.vscode/
+.DS_Store
+Thumbs.db
+*.md
