@@ -1,10 +1,11 @@
 //! The old binary formats (Office 97-2003, and WPS which shares them) as the matching OOXML package.
 //! Excel workbooks are rebuilt from their records (`xls.rs`) so cell formatting, sizes and pictures
 //! survive; Word documents go through office_oxide's model and get their pictures put back at their
-//! place and size (`doc.rs`); PowerPoint goes through office_oxide's model alone.
+//! place and size (`doc.rs`); PowerPoint decks are rebuilt from their records with every shape in place (`ppt.rs`).
 
 mod art;
 mod doc;
+mod ppt;
 mod xls;
 
 use std::borrow::Cow;
@@ -20,14 +21,14 @@ pub(crate) fn to_ooxml(bytes: Vec<u8>, family: OfficeFamily) -> Result<Vec<u8>, 
         OfficeFamily::Document => doc::to_docx(bytes),
         OfficeFamily::Presentation => {
             super::pptx::reject_powerpoint95(&bytes)?;
-            via_model(bytes, DocumentFormat::Ppt)
+            ppt::to_pptx(bytes)
         }
         OfficeFamily::Spreadsheet => xls::to_xlsx(bytes),
     }
 }
 
-/// office_oxide's own conversion, through its format-neutral model.
-// Limit: .ppt keeps text and simple layout only (pictures and shapes lose their geometry); a PPT record reader writing PresentationML lifts it.
+/// office_oxide's own conversion, through its format-neutral model: text and simple layout only. The
+/// fallback for files the record readers can't follow.
 fn via_model(bytes: Vec<u8>, from: DocumentFormat) -> Result<Vec<u8>, CoreError> {
     let to = match from {
         DocumentFormat::Doc => DocumentFormat::Docx,
