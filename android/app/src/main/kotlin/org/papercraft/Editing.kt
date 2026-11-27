@@ -95,10 +95,11 @@ interface EditableDoc : AutoCloseable {
 /** An editor screen: opens [file] (its unsaved draft instead when [restore]) in [EditShell]; [onClose] leaves it. */
 typealias EditorScreen = @Composable (file: DocFile, restore: Boolean, onClose: () -> Unit) -> Unit
 
-/** Every editor and the office family it edits. Word and Excel plug in with one line each here. */
+/** Every editor and the office family it edits; a new editor plugs in with one line here. */
 enum class Editor(val family: Category, val screen: EditorScreen) {
     Slides(Category.Slides, { file, restore, onClose -> SlideEditScreen(file, restore, onClose) }),
     Sheets(Category.Sheets, { file, restore, onClose -> SheetEditScreen(file, restore, onClose) }),
+    Words(Category.Docs, { file, restore, onClose -> WordEditScreen(file, restore, onClose) }),
 }
 
 /** The editor for files with extension [ext], or null when Papercraft can't edit them: only files the office engine opens are editable. */
