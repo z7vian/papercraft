@@ -5,14 +5,19 @@
 //! parser directly: it inflates only the parts a grid reads, parses one sheet at a time, and reads
 //! merged ranges in linear time. Pictures, charts, comments and formula recalculation are not here.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use betteroffice_xlsx::GridGeometry;
+use betteroffice_xlsx::fonts::{FontLoading, FontManager, FontSource, LastResortOffice};
+use ooxml_text::{FontId, FontStore};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use xlsx_model::numfmt::{FormattedValue, builtin_format_code, format_value};
+use xlsx_model::numfmt::{
+    FormatPartKind, FormattedValue, builtin_format_code, fit_general, format_value, is_general,
+};
 use xlsx_model::{
     BorderEdge, BorderStyle, CellRange, CellRef, CellValue, DateSystem, Fill, FormatCode, HAlign, MAX_COLS, MAX_ROWS,
     RunUnderline, Sheet, Stylesheet, VAlign,
@@ -26,6 +31,12 @@ const ENGINE_STACK: usize = 32 * 1024 * 1024;
 
 /// What an unparsed sheet's part holds while another sheet parses, so the engine skips it in no time.
 const BLANK_WORKSHEET: &[u8] = br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#;
+
+/// The engine's text inset from each side of a cell, in pixels at 96 dpi.
+const TEXT_PAD_PX: f32 = 2.0;
+
+/// The family a cell draws in when its font names none.
+const DEFAULT_FAMILY: &str = "Calibri";
 
 /// Parts a cell grid never reads (pictures, charts, pivot caches, macros, comments, metadata), left compressed.
 const SKIPPED_PARTS: [&str; 24] = [
@@ -198,7 +209,8 @@ pub struct SheetCell {
     /// 0-based column.
     pub col: u32,
     /// The value as Excel displays it: number formats, dates, percentages and currency applied.
-    // Limit: `*` fill characters are not repeated to the column width and numbers too wide for their column are not shown as `###`; measuring text against the column width lifts it.
+    /// `*` fill characters repeat across the cell, and a number too wide for its cell shows in fewer
+    /// digits (General format) or as `###`, measured in the faces the engine draws the cell's font with.
     pub text: String,
     pub kind: SheetValueKind,
     pub style: SheetCellStyle,
@@ -215,13 +227,15 @@ pub struct SheetDoc {
 #[uniffi::export]
 impl SheetDoc {
     /// Opens .xlsx/.xlsm/.xltx/.xltm/.xlam, and .xls/.xlt/.xla/.et/.ett through the legacy converter.
-    /// Parses the active sheet; the others parse when first asked for.
-    #[uniffi::constructor]
-    pub fn open(bytes: Vec<u8>, family: OfficeFamily) -> Result<Arc<Self>, CoreError> {
+    /// Parses the active sheet; the others parse when first asked for. `locale` is a BCP-47 tag such
+    /// as `en-GB` that sets Excel's locale-dependent short date formats; `None` reads them as en-US.
+    #[uniffi::constructor(default(locale = None))]
+    pub fn open(bytes: Vec<u8>, family: OfficeFamily, locale: Option<String>) -> Result<Arc<Self>, CoreError> {
         if !matches!(family, OfficeFamily::Spreadsheet) {
             return Err(CoreError::BadFile("Only spreadsheets open as a cell grid.".into()));
         }
         let (mut book, entries, active) = on_engine_stack(move || Book::unpack(bytes))??;
+        book.dates = short_date(locale.as_deref());
         let active = active.min(book.slots.len().saturating_sub(1));
         let names = book.parse(active)?;
         let listed = entries.len() == names.len();
@@ -285,7 +299,7 @@ impl SheetDoc {
             let Some(window) = window(first_row, row_count, first_col, col_count) else {
                 return Vec::new();
             };
-            Styler::new(&book.styles, book.date_system).window(&loaded.sheet, window)
+            Styler::new(book).window(loaded, window)
         })
     }
 
@@ -315,7 +329,7 @@ impl SheetDoc {
             let mut text = String::new();
             let mut last_row = None;
             for (at, cell) in loaded.sheet.iter_cells() {
-                let shown = display(&book.styles, book.date_system, cell.style.unwrap_or(0), &cell.value).text;
+                let shown = book.display(cell.style.unwrap_or(0), &cell.value).text;
                 if shown.is_empty() {
                     continue;
                 }
@@ -347,12 +361,22 @@ impl SheetDoc {
     }
 }
 
-/// The unpacked file: its parts, one slot per sheet, and the workbook's styles.
+/// The unpacked file: its parts, one slot per sheet, and what its sheets share.
 struct Book {
     parts: Vec<(String, Vec<u8>)>,
     slots: Vec<Slot>,
+    /// The shared strings, styles and date system the first parse reads. Their parts leave
+    /// [`Book::parts`] then, so later sheets parse without reading them again.
+    strings: Vec<String>,
     styles: Stylesheet,
     date_system: DateSystem,
+    workbook_read: bool,
+    dates: ShortDate,
+    /// Loaded when a cell is first measured.
+    fonts: RefCell<Option<Fonts>>,
+    /// Parses the shared strings part was given to.
+    #[cfg(test)]
+    string_reads: usize,
 }
 
 struct Slot {
@@ -424,7 +448,18 @@ impl Book {
                 loaded: None,
             })
             .collect();
-        let book = Self { parts, slots, styles: Stylesheet::default(), date_system: DateSystem::default() };
+        let book = Self {
+            parts,
+            slots,
+            strings: Vec::new(),
+            styles: Stylesheet::default(),
+            date_system: DateSystem::default(),
+            workbook_read: false,
+            dates: short_date(None),
+            fonts: RefCell::new(None),
+            #[cfg(test)]
+            string_reads: 0,
+        };
         Ok((book, entries, active))
     }
 
@@ -449,6 +484,10 @@ impl Book {
             };
             self.parts[part].1 = body;
         }
+        #[cfg(test)]
+        {
+            self.string_reads += usize::from(position(&self.parts, "xl/sharedStrings.xml").is_some());
+        }
         let parts = &self.parts;
         let parsed = on_engine_stack(|| xlsx_parse::parse_workbook(parts));
         if let Some(part) = part {
@@ -457,7 +496,7 @@ impl Book {
                 self.slots[index].xml = Some(body);
             }
         }
-        let model = parsed?.map_err(bad)?;
+        let mut model = parsed?.map_err(bad)?;
         if model.sheets.len() != self.slots.len() {
             if !self.slots.is_empty() {
                 // The workbook part read differently here than in the engine: put every sheet back
@@ -472,8 +511,15 @@ impl Book {
             }
             self.slots = model.sheets.iter().map(|_| Slot { part: None, xml: None, loaded: None }).collect();
         }
-        if let Some(slot) = self.slots.get_mut(index) {
-            slot.xml = None;
+        // The sheet's own part, read again for its shared strings when an earlier parse read them.
+        let xml = self.slots.get_mut(index).and_then(|slot| slot.xml.take());
+        let first = !self.workbook_read;
+        if first {
+            self.strings = std::mem::take(&mut model.shared_strings);
+            self.styles = std::mem::take(&mut model.styles);
+            self.date_system = model.date_system;
+            self.drop_workbook_parts();
+            self.workbook_read = true;
         }
         let names = model.sheets.iter().map(|sheet| sheet.name.clone()).collect();
         for (at, mut sheet) in model.sheets.into_iter().enumerate() {
@@ -481,18 +527,55 @@ impl Book {
             if slot.loaded.is_some() || (at != index && slot.part.is_some()) {
                 continue;
             }
-            if at == index
-                && let Some(mut merges) = own_merges.take()
-            {
-                merges.append(&mut sheet.merges);
-                normalize_merges(&mut merges);
-                sheet.merges = merges;
+            if at == index {
+                if let Some(mut merges) = own_merges.take() {
+                    merges.append(&mut sheet.merges);
+                    normalize_merges(&mut merges);
+                    sheet.merges = merges;
+                }
+                if !first && let Some(xml) = &xml {
+                    add_shared_strings(&mut sheet, xml, &self.strings)?;
+                }
             }
-            slot.loaded = Some(Loaded::measure(sheet, &model.styles));
+            slot.loaded = Some(Loaded::measure(sheet, &self.styles));
         }
-        self.styles = model.styles;
-        self.date_system = model.date_system;
         Ok(names)
+    }
+
+    /// Empties the shared strings, styles and theme parts, found as the engine finds them.
+    fn drop_workbook_parts(&mut self) {
+        let rels = find(&self.parts, "xl/_rels/workbook.xml.rels");
+        let paths = [("sharedStrings", "xl/sharedStrings.xml"), ("styles", "xl/styles.xml"), ("theme", "xl/theme/theme1.xml")]
+            .map(|(kind, fallback)| {
+                rels.and_then(|rels| typed_target(rels, kind))
+                    .map_or_else(|| fallback.to_string(), |target| resolve_part_path("xl", &target))
+            });
+        for path in paths {
+            if let Some(at) = position(&self.parts, &path)
+                && !self.slots.iter().any(|slot| slot.part == Some(at))
+            {
+                // The engine looks parts up by name and never finds a nameless one.
+                self.parts[at] = (String::new(), Vec::new());
+            }
+        }
+    }
+
+    /// The number format code of cell format `xf`, built-ins 14 and 22 in the caller's locale.
+    fn format_code(&self, xf: u32) -> &str {
+        match self.styles.format_code_for(xf) {
+            FormatCode::Custom(code) => code,
+            FormatCode::Builtin(14) => self.dates.date,
+            FormatCode::Builtin(22) => self.dates.date_time,
+            FormatCode::Builtin(id) => builtin_format_code(id).unwrap_or("General"),
+        }
+    }
+
+    /// The value as Excel shows it in the cell's number format, before it is fitted to the cell.
+    fn display(&self, xf: u32, value: &CellValue) -> FormattedValue {
+        if matches!(value, CellValue::Empty) {
+            return Default::default();
+        }
+        format_value(value, self.format_code(xf), self.date_system)
     }
 }
 
@@ -547,6 +630,17 @@ impl Loaded {
         }
         Self { sheet, cols, rows, default_col_px, default_row_px }
     }
+
+    /// Pixels at 96 dpi of columns `first..=last`.
+    fn span_px(&self, first: u32, last: u32) -> f32 {
+        let start = self.cols.partition_point(|run| run.last < first);
+        let mut px = (last - first + 1) as f32 * self.default_col_px;
+        for run in self.cols[start..].iter().take_while(|run| run.first <= last) {
+            let overlap = run.last.min(last) - run.first.max(first) + 1;
+            px += overlap as f32 * (run.px - self.default_col_px);
+        }
+        px
+    }
 }
 
 fn push_run(runs: &mut Vec<SheetSizeRun>, index: u32, px: f32, default: f32) {
@@ -586,47 +680,63 @@ impl From<CellRange> for SheetRange {
 
 /// Turns cells into [`SheetCell`]s, resolving each cell format once per call.
 struct Styler<'a> {
-    styles: &'a Stylesheet,
-    date_system: DateSystem,
+    book: &'a Book,
     formats: HashMap<u32, Format>,
+    /// One indent level in pixels, measured on first use.
+    indent_px: Option<f32>,
 }
 
 /// A cell format resolved for drawing.
 struct Format {
     style: SheetCellStyle,
     h: Option<HAlign>,
+    indent: u32,
     /// Draws something on a blank cell: a fill or a border.
     visible: bool,
+    /// The font's faces in [`Fonts`], resolved on first measurement.
+    font: Option<usize>,
 }
 
 impl<'a> Styler<'a> {
-    fn new(styles: &'a Stylesheet, date_system: DateSystem) -> Self {
-        Self { styles, date_system, formats: HashMap::new() }
+    fn new(book: &'a Book) -> Self {
+        Self { book, formats: HashMap::new(), indent_px: None }
     }
 
-    fn format(&mut self, xf: u32) -> &Format {
-        let styles = self.styles;
+    fn format(&mut self, xf: u32) -> &mut Format {
+        let styles = &self.book.styles;
         self.formats.entry(xf).or_insert_with(|| resolve_format(styles, xf))
     }
 
-    fn window(&mut self, sheet: &Sheet, window: CellRange) -> Vec<SheetCell> {
+    fn window(&mut self, loaded: &Loaded, window: CellRange) -> Vec<SheetCell> {
+        let sheet = &loaded.sheet;
         let merges: Vec<CellRange> = sheet.merges.iter().copied().filter(|&range| intersects(range, window)).collect();
         let covered = |at: CellRef| merges.iter().any(|range| range.contains(at) && range.start != at);
         let mut out = Vec::new();
         for (at, cell) in sheet.cells_in_range(window) {
             let xf = cell.style.unwrap_or(0);
             let value = if covered(at) { &CellValue::Empty } else { &cell.value };
-            let shown = display(self.styles, self.date_system, xf, value);
-            let format = self.format(xf);
-            if shown.text.is_empty() && !format.visible {
+            let shown = self.book.display(xf, value);
+            if shown.text.is_empty() && !self.format(xf).visible {
                 continue;
             }
+            let color = shown.color.as_deref().and_then(argb);
+            let fits = !shown.text.is_empty()
+                && (matches!(value, CellValue::Number { .. })
+                    || shown.layout.iter().any(|part| part.kind == FormatPartKind::Fill));
+            let text = if fits {
+                let last = merges.iter().find(|range| range.start == at).map_or(at.col, |range| range.end.col);
+                let width = self.text_width(xf, loaded.span_px(at.col, last));
+                self.fit(xf, value, shown, width)
+            } else {
+                shown.text
+            };
+            let format = self.format(xf);
             let mut style = format.style.clone();
             style.h_align = h_align(format.h, value);
-            if let Some(color) = shown.color.as_deref().and_then(argb) {
+            if let Some(color) = color {
                 style.font_color = Some(color);
             }
-            out.push(SheetCell { row: at.row, col: at.col, text: shown.text, kind: kind(value), style });
+            out.push(SheetCell { row: at.row, col: at.col, text, kind: kind(value), style });
         }
         if !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty() {
             let before = out.len();
@@ -662,6 +772,197 @@ impl<'a> Styler<'a> {
                 }
             }
         }
+    }
+
+    /// Pixels the engine lays text out in for a cell `cell_px` wide in format `xf`: the cell less
+    /// its padding and a left or right indent.
+    fn text_width(&mut self, xf: u32, cell_px: f32) -> f32 {
+        let format = self.format(xf);
+        let indent = match format.h {
+            Some(HAlign::Left | HAlign::Right) if format.indent > 0 => format.indent as f32,
+            _ => 0.0,
+        };
+        let indent = if indent > 0.0 { indent * self.indent_px() } else { 0.0 };
+        (cell_px - 2.0 * TEXT_PAD_PX - indent).max(0.0)
+    }
+
+    /// One indent level: three spaces of the normal font, each on whole pixels, as the engine lays it out.
+    fn indent_px(&mut self) -> f32 {
+        if let Some(px) = self.indent_px {
+            return px;
+        }
+        let book = self.book;
+        let normal = book.styles.font_for(0).or_else(|| book.styles.fonts.first());
+        let family = normal.and_then(|font| font.name.as_deref()).unwrap_or(DEFAULT_FAMILY);
+        let size = normal.and_then(|font| font.size_pt).filter(|pt| pt.is_finite() && *pt > 0.0).unwrap_or(11.0) as f32;
+        let mut fonts = book.fonts.borrow_mut();
+        let fonts = fonts.get_or_insert_with(Fonts::new);
+        let chain = fonts.chain(family, false, false);
+        let px = 3.0 * fonts.width(chain, size, " ").round();
+        self.indent_px = Some(px);
+        px
+    }
+
+    /// The faces format `xf`'s font draws with.
+    fn font(&mut self, xf: u32) -> usize {
+        let book = self.book;
+        let fonts = &book.fonts;
+        let format = self.format(xf);
+        if let Some(font) = format.font {
+            return font;
+        }
+        let style = &format.style;
+        let font = fonts.borrow_mut().get_or_insert_with(Fonts::new).chain(
+            style.font_name.as_deref().unwrap_or(DEFAULT_FAMILY),
+            style.bold,
+            style.italic,
+        );
+        format.font = Some(font);
+        font
+    }
+
+    /// The text as the engine draws it `width` pixels wide: a number too wide in fewer digits
+    /// (General format) or as `#` repeated, else the `*` fill character repeated across the space left.
+    fn fit(&mut self, xf: u32, value: &CellValue, shown: FormattedValue, width: f32) -> String {
+        let font = self.font(xf);
+        let size = self.format(xf).style.font_size_pt;
+        let book = self.book;
+        let mut fonts = book.fonts.borrow_mut();
+        let fonts = &*fonts.get_or_insert_with(Fonts::new);
+        let mut measure = |text: &str| fonts.width(font, size, text);
+        let FormattedValue { mut text, layout, .. } = shown;
+        let mut fixed = 0.0;
+        let mut cursor = 0;
+        let mut fill = None;
+        for part in &layout {
+            fixed += measure(&text[cursor..part.offset]);
+            if part.kind == FormatPartKind::Padding {
+                fixed += measure(part.character.encode_utf8(&mut [0; 4]));
+                cursor = part.offset + 1;
+            } else {
+                fill = Some(*part);
+                cursor = part.offset;
+            }
+        }
+        fixed += measure(&text[cursor..]);
+        if let CellValue::Number { value: number } = value
+            && fixed > width
+        {
+            let general = is_general(value, book.format_code(xf));
+            return general.then(|| fit_general(*number, width, &mut measure)).flatten().unwrap_or_else(|| {
+                let advance = measure("#");
+                let count =
+                    if advance > 0.0 && width > 0.0 { (width / advance).floor().max(1.0) as usize } else { 0 };
+                "#".repeat(count)
+            });
+        }
+        if let Some(part) = fill {
+            let character = part.character.encode_utf8(&mut [0; 4]).to_owned();
+            let advance = measure(&character);
+            let extra = (width - fixed).max(0.0);
+            if advance > 0.0 && extra >= advance {
+                text.insert_str(part.offset, &character.repeat((extra / advance).floor() as usize));
+            }
+        }
+        text
+    }
+}
+
+/// Text widths in the bundled faces the engine draws a font with, as its raster backend measures them.
+struct Fonts {
+    /// `None` when the bundled faces can't load: widths then take Calibri's advances, as the engine
+    /// measures without a face.
+    manager: Option<FontManager>,
+    store: FontStore,
+    /// Registered faces by bundled family and style.
+    faces: HashMap<(String, bool, bool), FontId>,
+    /// Index in `chains` by requested family and style.
+    keys: HashMap<(String, bool, bool), usize>,
+    /// Faces a font draws with, first face first.
+    chains: Vec<Vec<FontId>>,
+}
+
+impl Fonts {
+    fn new() -> Self {
+        Self {
+            manager: FontManager::new(&FontSource::default(), FontLoading::OnDemand).ok(),
+            store: FontStore::new(),
+            faces: HashMap::new(),
+            keys: HashMap::new(),
+            chains: Vec::new(),
+        }
+    }
+
+    /// The faces `family` draws with, as an index for [`Fonts::width`].
+    fn chain(&mut self, family: &str, bold: bool, italic: bool) -> usize {
+        let family = if family.trim().is_empty() { DEFAULT_FAMILY } else { family.trim() };
+        let key = (family.to_lowercase(), bold, italic);
+        if let Some(&chain) = self.keys.get(&key) {
+            return chain;
+        }
+        let mut chain = Vec::new();
+        if let Some(manager) = &self.manager {
+            for face in manager.resolve(family, bold, italic, &[], LastResortOffice::Word) {
+                let face_key = (face.family.clone(), face.bold, face.italic);
+                let id = match self.faces.get(&face_key) {
+                    Some(&id) => id,
+                    None => {
+                        let Some(id) = face.load().ok().and_then(|bytes| self.store.register(bytes).ok()) else {
+                            continue;
+                        };
+                        self.faces.insert(face_key, id);
+                        id
+                    }
+                };
+                if !chain.contains(&id) {
+                    chain.push(id);
+                }
+            }
+        }
+        self.chains.push(chain);
+        self.keys.insert(key, self.chains.len() - 1);
+        self.chains.len() - 1
+    }
+
+    /// Pixels at 96 dpi `text` takes at `size_pt`, each run in the first face of `chain` that has its characters.
+    fn width(&self, chain: usize, size_pt: f32, text: &str) -> f32 {
+        let chain = &self.chains[chain];
+        if chain.is_empty() {
+            return xlsx_render::wrap::estimate_text_width(text, f64::from(size_pt));
+        }
+        let px = size_pt * 96.0 / 72.0;
+        let face = |ch: char| {
+            chain
+                .iter()
+                .position(|&id| {
+                    ch.is_control()
+                        || ch.is_whitespace()
+                        || matches!(ch as u32, 0x200b..=0x200f | 0xfe00..=0xfe0f)
+                        || self.store.glyph_id(id, ch).ok().flatten().is_some()
+                })
+                .unwrap_or(0)
+        };
+        let run = |id: FontId, text: &str| {
+            ooxml_text::shape(&self.store, id, text, px, &[])
+                .map_or(0.0, |glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>())
+        };
+        let mut total = 0.0;
+        let mut start = 0;
+        let mut current = None;
+        for (offset, ch) in text.char_indices() {
+            let index = face(ch);
+            if let Some(previous) = current
+                && previous != index
+            {
+                total += run(chain[previous], &text[start..offset]);
+                start = offset;
+            }
+            current = Some(index);
+        }
+        if let Some(index) = current {
+            total += run(chain[index], &text[start..]);
+        }
+        total
     }
 }
 
@@ -705,27 +1006,62 @@ fn resolve_format(styles: &Stylesheet, xf: u32) -> Format {
         || style.border_right.is_some()
         || style.border_top.is_some()
         || style.border_bottom.is_some();
-    Format { style, h: alignment.h, visible }
+    Format { style, h: alignment.h, indent: alignment.indent.unwrap_or(0), visible, font: None }
 }
 
-/// The value as Excel shows it in the cell's number format.
-fn display(
-    styles: &Stylesheet,
-    date_system: DateSystem,
-    xf: u32,
-    value: &CellValue,
-) -> FormattedValue {
-    if matches!(value, CellValue::Empty) {
-        return Default::default();
+/// Excel's locale-dependent built-in number formats: 14 (short date) and 22 (short date and time).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ShortDate {
+    date: &'static str,
+    date_time: &'static str,
+}
+
+impl ShortDate {
+    const fn new(date: &'static str, date_time: &'static str) -> Self {
+        Self { date, date_time }
     }
-    // Limit: built-in date formats 14 and 22 follow Excel's en-US short date; the device locale lifts it.
-    let code = match styles.format_code_for(xf) {
-        FormatCode::Custom(code) => code,
-        FormatCode::Builtin(14) => "m/d/yyyy",
-        FormatCode::Builtin(22) => "m/d/yyyy h:mm",
-        FormatCode::Builtin(id) => builtin_format_code(id).unwrap_or("General"),
+}
+
+/// The short date Windows sets for the BCP-47 `locale` (en-US when `None`), which Excel uses for
+/// built-in formats 14 and 22.
+// Limit: a table of common locales; other languages take day/month/year with slashes (month first in the
+// United States and its territories). Passing the device's own short date pattern lifts it.
+fn short_date(locale: Option<&str>) -> ShortDate {
+    const US: ShortDate = ShortDate::new("m/d/yyyy", "m/d/yyyy h:mm");
+    const DMY_SLASH: ShortDate = ShortDate::new("dd/mm/yyyy", "dd/mm/yyyy hh:mm");
+    const DMY_DOT: ShortDate = ShortDate::new("dd.mm.yyyy", "dd.mm.yyyy hh:mm");
+    const DMY_DASH: ShortDate = ShortDate::new("dd-mm-yyyy", "dd-mm-yyyy hh:mm");
+    const YMD_DASH: ShortDate = ShortDate::new("yyyy-mm-dd", "yyyy-mm-dd hh:mm");
+    const YMD_SLASH: ShortDate = ShortDate::new("yyyy/mm/dd", "yyyy/mm/dd h:mm");
+
+    let Some(tag) = locale.map(str::trim).filter(|tag| !tag.is_empty()) else {
+        return US;
     };
-    format_value(value, code, date_system)
+    let mut subtags = tag.split(['-', '_']);
+    let language = subtags.next().unwrap_or_default().to_ascii_lowercase();
+    // The region: the first two-letter or three-digit subtag, before any extension.
+    let region = subtags
+        .take_while(|subtag| subtag.len() > 1)
+        .find(|subtag| {
+            (subtag.len() == 2 && subtag.chars().all(|ch| ch.is_ascii_alphabetic()))
+                || (subtag.len() == 3 && subtag.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .map(str::to_ascii_uppercase);
+    match (language.as_str(), region.as_deref()) {
+        (_, Some("US" | "PH" | "PR" | "AS" | "GU" | "MP" | "UM" | "VI" | "FM" | "MH" | "PW")) | ("en", None) => US,
+        ("en", Some("AU" | "NZ")) | ("nl", Some("BE")) => ShortDate::new("d/mm/yyyy", "d/mm/yyyy h:mm"),
+        ("en" | "fr", Some("CA")) | ("sv" | "lt", _) => YMD_DASH,
+        ("en", Some("ZA")) | ("ja", _) => YMD_SLASH,
+        ("en", Some("IN")) | ("hi" | "da", _) => DMY_DASH,
+        ("de" | "ru" | "pl" | "tr" | "uk" | "nb" | "no" | "nn" | "ro" | "cs" | "sk" | "be" | "kk" | "az" | "et" | "lv", _)
+        | (_, Some("CH")) => DMY_DOT,
+        ("fi", _) => ShortDate::new("d.m.yyyy", "d.m.yyyy h:mm"),
+        ("nl", _) => ShortDate::new("d-m-yyyy", "d-m-yyyy hh:mm"),
+        ("hu", _) => ShortDate::new("yyyy.mm.dd", "yyyy.mm.dd h:mm"),
+        ("zh", _) => ShortDate::new("yyyy/m/d", "yyyy/m/d h:mm"),
+        ("ko", _) => ShortDate::new("yyyy-mm-dd", "yyyy-mm-dd h:mm"),
+        _ => DMY_SLASH,
+    }
 }
 
 /// Excel's "General" alignment: numbers right, logical values and errors centred, text left.
@@ -909,6 +1245,138 @@ fn split_merges(xml: &[u8]) -> Result<Option<(Vec<u8>, Vec<CellRange>)>, CoreErr
     Ok(Some((body, merges)))
 }
 
+/// Puts the shared strings back into a sheet the engine parsed without the shared strings part,
+/// from the cells of its worksheet `xml` typed `s`. Cells are addressed and their `<v>` read as
+/// the engine reads them.
+fn add_shared_strings(sheet: &mut Sheet, xml: &[u8], strings: &[String]) -> Result<(), CoreError> {
+    /// A `<c>` element being read.
+    struct Open {
+        depth: usize,
+        at: CellRef,
+        shared: bool,
+        value: Option<String>,
+        /// Depth of an `mc:AlternateContent` directly under the cell.
+        alternate: Option<usize>,
+        /// Depth of that block's `mc:Fallback`, whose children count as the cell's own.
+        fallback: Option<usize>,
+    }
+    if strings.is_empty() {
+        return Ok(());
+    }
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().expand_empty_elements = true;
+    let mut buf = Vec::new();
+    let mut depth = 0usize;
+    let mut row: Option<u32> = None;
+    let mut cursor = 0u32;
+    let mut cell: Option<Open> = None;
+    loop {
+        buf.clear();
+        // A `<v>` of the open cell starts: read once the event releases `buf`.
+        let mut value_starts = false;
+        match reader.read_event_into(&mut buf).map_err(bad)? {
+            Event::Start(e) => {
+                depth += 1;
+                if let Some(open) = cell.as_mut() {
+                    let name = e.local_name();
+                    let name = name.as_ref();
+                    let direct = depth == open.depth + 1;
+                    if direct {
+                        open.alternate = (name == b"AlternateContent").then_some(depth);
+                        open.fallback = None;
+                    }
+                    if open.alternate.is_some_and(|at| depth == at + 1) {
+                        open.fallback = (name == b"Fallback").then_some(depth);
+                    } else if open.alternate != Some(depth) {
+                        value_starts = name == b"v" && (direct || open.fallback.is_some_and(|at| depth == at + 1));
+                    }
+                } else {
+                    match e.local_name().as_ref() {
+                        b"row" => {
+                            row = Some(match attr(&e, b"r") {
+                                Some(r) => r
+                                    .parse::<u32>()
+                                    .ok()
+                                    .filter(|r| (1..=MAX_ROWS).contains(r))
+                                    .ok_or_else(|| bad(format!("bad row {r:?}")))?
+                                    - 1,
+                                None => row.map_or(0, |row| row + 1),
+                            });
+                            cursor = 0;
+                        }
+                        b"c" => {
+                            let at = match attr(&e, b"r") {
+                                Some(r) => CellRef::parse_a1(&r).map_err(|_| bad(format!("bad cell ref {r:?}")))?,
+                                None => CellRef::new(row.unwrap_or(0), cursor),
+                            };
+                            cursor = at.col;
+                            let shared = attr(&e, b"t").as_deref() == Some("s");
+                            cell = Some(Open { depth, at, shared, value: None, alternate: None, fallback: None });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::End(e) => {
+                depth = depth.saturating_sub(1);
+                if cell.as_ref().is_some_and(|open| depth >= open.depth) {
+                    continue;
+                }
+                match e.local_name().as_ref() {
+                    b"c" => {
+                        if let Some(open) = cell.take()
+                            && open.shared
+                            && let Some(text) = open
+                                .value
+                                .as_deref()
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .and_then(|index| strings.get(index))
+                        {
+                            sheet.set_calculated_value(open.at, CellValue::Text { value: text.clone() });
+                        }
+                        cursor += 1;
+                    }
+                    b"row" => row = None,
+                    _ => {}
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if value_starts && let Some(open) = cell.as_mut() {
+            open.value = Some(element_text(&mut reader, &mut buf, &mut depth)?);
+        }
+    }
+    Ok(())
+}
+
+/// The text inside the element whose start was just read, nested markup flattened.
+fn element_text(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>, depth: &mut usize) -> Result<String, CoreError> {
+    let target = *depth;
+    let mut out = String::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(buf).map_err(bad)? {
+            Event::Start(_) => *depth += 1,
+            Event::End(_) => {
+                *depth = depth.saturating_sub(1);
+                if *depth < target {
+                    break;
+                }
+            }
+            Event::Text(text) => out.push_str(&text.xml10_content().map_err(bad)?),
+            Event::CData(text) => out.push_str(&text.xml10_content().map_err(bad)?),
+            Event::GeneralRef(reference) => {
+                let name = reference.decode().map_err(bad)?;
+                out.push_str(&quick_xml::escape::unescape(&format!("&{name};")).map_err(bad)?);
+            }
+            Event::Eof => return Err(bad("a cell value ends early")),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
@@ -972,6 +1440,26 @@ fn relationships(xml: &[u8]) -> Option<HashMap<String, Relationship>> {
         }
     }
     Some(rels)
+}
+
+/// The target of the first relationship whose type ends in `/kind`, as the engine finds a workbook part.
+fn typed_target(xml: &[u8], kind: &str) -> Option<String> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf).ok()? {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"Relationship" => {
+                if let (Some(kind_uri), Some(target)) = (attr(&e, b"Type"), attr(&e, b"Target"))
+                    && kind_uri.strip_suffix(kind).is_some_and(|rest| rest.ends_with('/'))
+                {
+                    return Some(target);
+                }
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
 }
 
 /// An attribute by local name, prefix ignored, unescaped.
@@ -1050,7 +1538,7 @@ mod tests {
     }
 
     fn open(name: &str) -> Arc<SheetDoc> {
-        SheetDoc::open(fixture(name), OfficeFamily::Spreadsheet).unwrap()
+        SheetDoc::open(fixture(name), OfficeFamily::Spreadsheet, None).unwrap()
     }
 
     fn cell(doc: &SheetDoc, sheet: u32, a1: &str) -> SheetCell {
@@ -1167,7 +1655,7 @@ mod tests {
         for name in ["simple-monthly-budget.xlsx", "47737.xlsx"] {
             let bytes = fixture(name);
             let workbook = Workbook::open_for_read(&bytes).unwrap();
-            let doc = SheetDoc::open(bytes, OfficeFamily::Spreadsheet).unwrap();
+            let doc = SheetDoc::open(bytes, OfficeFamily::Spreadsheet, None).unwrap();
             for index in 0..workbook.sheet_count() as u32 {
                 let expected: Vec<SheetRange> =
                     workbook.sheet(SheetId(index)).unwrap().merges.iter().map(|&merged| merged.into()).collect();
@@ -1210,7 +1698,62 @@ mod tests {
 
     #[test]
     fn other_families_are_refused() {
-        assert!(SheetDoc::open(fixture("Formatting.xlsx"), OfficeFamily::Document).is_err());
+        assert!(SheetDoc::open(fixture("Formatting.xlsx"), OfficeFamily::Document, None).is_err());
+    }
+
+    // Generated workbook: 1,234,567.89 in columns 3 and 30 characters wide, and 5 behind a `-` fill
+    // in columns 10 and 30 characters wide.
+    #[test]
+    fn narrow_numbers_show_hashes_and_fill_characters_repeat() {
+        let sheet = r#"<cols><col min="1" max="1" width="3" customWidth="1"/><col min="2" max="2" width="30" customWidth="1"/><col min="3" max="3" width="10" customWidth="1"/><col min="4" max="4" width="30" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="2"><v>1234567.891</v></c><c r="B1" s="2"><v>1234567.891</v></c><c r="C1" s="3"><v>5</v></c><c r="D1" s="3"><v>5</v></c></row></sheetData>"#;
+        let doc = SheetDoc::open(package(&[sheet], None, Vec::new()), OfficeFamily::Spreadsheet, None).unwrap();
+        let narrow = text(&doc, 0, "A1");
+        assert!(!narrow.is_empty() && narrow.chars().all(|ch| ch == '#'), "{narrow:?}");
+        assert_eq!(text(&doc, 0, "B1"), "1,234,567.89");
+        let dashes = |a1: &str| {
+            let shown = text(&doc, 0, a1);
+            let fill = shown.strip_suffix('5').unwrap_or_else(|| panic!("{a1}: {shown:?}"));
+            assert!(fill.chars().all(|ch| ch == '-'), "{a1}: {shown:?}");
+            fill.len()
+        };
+        let (narrow, wide) = (dashes("C1"), dashes("D1"));
+        assert!(narrow >= 5 && wide > 2 * narrow, "{narrow} then {wide} dashes");
+        // Search text is not fitted to any width.
+        assert_eq!(doc.sheet_text(0).unwrap(), "1,234,567.89\t1,234,567.89\t5\t5");
+    }
+
+    // Generated workbook: 24 November 2006 at noon in built-in formats 14 and 22.
+    #[test]
+    fn short_dates_follow_the_locale() {
+        let sheet = r#"<cols><col min="1" max="2" width="30" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="4"><v>39045.5</v></c><c r="B1" s="5"><v>39045.5</v></c></row></sheetData>"#;
+        let bytes = package(&[sheet], None, Vec::new());
+        let shown = |locale: Option<&str>| {
+            let doc = SheetDoc::open(bytes.clone(), OfficeFamily::Spreadsheet, locale.map(String::from)).unwrap();
+            (text(&doc, 0, "A1"), text(&doc, 0, "B1"))
+        };
+        let pair = |date: &str, date_time: &str| (date.to_string(), date_time.to_string());
+        assert_eq!(shown(None), pair("11/24/2006", "11/24/2006 12:00"));
+        assert_eq!(shown(Some("en-US")), pair("11/24/2006", "11/24/2006 12:00"));
+        assert_eq!(shown(Some("en-GB")), pair("24/11/2006", "24/11/2006 12:00"));
+        assert_eq!(shown(Some("de-DE")), pair("24.11.2006", "24.11.2006 12:00"));
+        assert_eq!(shown(Some("ja-JP")), pair("2006/11/24", "2006/11/24 12:00"));
+    }
+
+    // Generated workbook: two sheets reading one shared strings part, the second with a cell addressed
+    // by its position, an index past the table, a rich string and a merged range.
+    #[test]
+    fn shared_strings_parse_once_per_workbook() {
+        let first = r#"<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>"#;
+        let second = r#"<sheetData><row r="1"><c r="A1" t="s"><v>2</v></c><c t="s"><v>1</v></c><c r="D1" t="s"><v>7</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="E1:F1"/></mergeCells>"#;
+        let strings = "<si><t>alpha</t></si><si><t>beta</t></si><si><r><t>gam</t></r><r><t>ma</t></r></si>";
+        let doc = SheetDoc::open(package(&[first, second], Some(strings), Vec::new()), OfficeFamily::Spreadsheet, None)
+            .unwrap();
+        assert_eq!(text(&doc, 0, "A1"), "alpha");
+        assert_eq!(doc.sheet_text(1).unwrap(), "gamma\tbeta");
+        let second_cell = cell(&doc, 1, "B1");
+        assert_eq!((second_cell.kind, second_cell.style.h_align), (SheetValueKind::Text, SheetHAlign::Left));
+        assert_eq!(doc.merges(1).unwrap(), vec![range("E1:F1")]);
+        assert_eq!(doc.book.lock().unwrap().string_reads, 1);
     }
 
     /// Before/after open timings on a generated workbook shaped like the slow spike files (many
@@ -1228,7 +1771,7 @@ mod tests {
         let open_for_read = started.elapsed();
 
         let started = Instant::now();
-        let doc = SheetDoc::open(bytes, OfficeFamily::Spreadsheet).unwrap();
+        let doc = SheetDoc::open(bytes, OfficeFamily::Spreadsheet, None).unwrap();
         let small = doc.cells(0, 0, 40, 0, 10).unwrap();
         let first_view = started.elapsed();
         let started = Instant::now();
@@ -1254,10 +1797,67 @@ mod tests {
         .unwrap();
     }
 
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+    /// Cell formats of generated workbooks: 0 General, 1 `0.00%`, 2 `#,##0.00`, 3 `*-0` (a `-` fill
+    /// before the number), 4 and 5 the built-in short date and short date with time.
+    const STYLES: &str = r#"<numFmts count="1"><numFmt numFmtId="164" formatCode="*-0"/></numFmts><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="22" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>"#;
+
+    /// A workbook with one sheet per worksheet body in `sheets`, the cell formats [`STYLES`], the
+    /// shared strings `strings` (`<si>` items) when given, and `extra` parts nothing links to.
+    fn package(sheets: &[&str], strings: Option<&str>, extra: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+        let sheet_type = "application/vnd.openxmlformats-officedocument.spreadsheetml";
+        let mut entries = String::new();
+        let mut rels = String::new();
+        let mut types = String::new();
+        let mut worksheets = Vec::new();
+        for (index, body) in sheets.iter().enumerate() {
+            let n = index + 1;
+            write!(entries, r#"<sheet name="Sheet{n}" sheetId="{n}" r:id="rId{n}"/>"#).unwrap();
+            write!(rels, r#"<Relationship Id="rId{n}" Type="{REL}/worksheet" Target="worksheets/sheet{n}.xml"/>"#).unwrap();
+            write!(types, r#"<Override PartName="/xl/worksheets/sheet{n}.xml" ContentType="{sheet_type}.worksheet+xml"/>"#)
+                .unwrap();
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{MAIN}">{body}</worksheet>"#
+            );
+            worksheets.push((format!("xl/worksheets/sheet{n}.xml"), xml.into_bytes()));
+        }
+        let next = sheets.len() + 1;
+        write!(rels, r#"<Relationship Id="rId{next}" Type="{REL}/styles" Target="styles.xml"/>"#).unwrap();
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        if let Some(strings) = strings {
+            write!(rels, r#"<Relationship Id="rId{}" Type="{REL}/sharedStrings" Target="sharedStrings.xml"/>"#, next + 1)
+                .unwrap();
+            write!(types, r#"<Override PartName="/xl/sharedStrings.xml" ContentType="{sheet_type}.sharedStrings+xml"/>"#)
+                .unwrap();
+            parts.push(("xl/sharedStrings.xml".into(), format!(r#"<sst xmlns="{MAIN}">{strings}</sst>"#).into_bytes()));
+        }
+        let content_types = format!(
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/xl/workbook.xml" ContentType="{sheet_type}.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="{sheet_type}.styles+xml"/>{types}</Types>"#
+        );
+        let root_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+        );
+        let workbook = format!(r#"<workbook xmlns="{MAIN}" xmlns:r="{REL}"><sheets>{entries}</sheets></workbook>"#);
+        let workbook_rels =
+            format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#);
+        let styles = format!(r#"<styleSheet xmlns="{MAIN}">{STYLES}</styleSheet>"#);
+        let mut all: Vec<(String, Vec<u8>)> = vec![
+            ("[Content_Types].xml".into(), content_types.into_bytes()),
+            ("_rels/.rels".into(), root_rels.into_bytes()),
+            ("xl/workbook.xml".into(), workbook.into_bytes()),
+            ("xl/_rels/workbook.xml.rels".into(), workbook_rels.into_bytes()),
+            ("xl/styles.xml".into(), styles.into_bytes()),
+        ];
+        all.append(&mut parts);
+        all.append(&mut worksheets);
+        all.extend(extra);
+        ooxml_opc::rezip_parts(&all).unwrap()
+    }
+
     fn generated_workbook(rows: u32) -> Vec<u8> {
-        const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-        const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        let mut big = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{MAIN}"><sheetData>"#);
+        let mut big = String::from("<sheetData>");
         for row in 1..=rows {
             let half = f64::from(row) / 2.0;
             write!(
@@ -1270,24 +1870,8 @@ mod tests {
         for row in 1..=rows {
             write!(big, r#"<mergeCell ref="B{row}:C{row}"/>"#).unwrap();
         }
-        big.push_str("</mergeCells></worksheet>");
-        let small = format!(r#"<worksheet xmlns="{MAIN}"><sheetData><row r="1"><c r="A1" s="1"><v>0.25</v></c></row></sheetData></worksheet>"#);
-        let workbook = format!(
-            r#"<workbook xmlns="{MAIN}" xmlns:r="{REL}"><sheets><sheet name="Small" sheetId="1" r:id="rId1"/><sheet name="Big" sheetId="2" r:id="rId2"/></sheets></workbook>"#
-        );
-        let workbook_rels = format!(
-            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{REL}/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="{REL}/styles" Target="styles.xml"/></Relationships>"#
-        );
-        let root_rels = format!(
-            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
-        );
-        let styles = format!(
-            r#"<styleSheet xmlns="{MAIN}"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>"#
-        );
-        let sheet_type = "application/vnd.openxmlformats-officedocument.spreadsheetml";
-        let content_types = format!(
-            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/xl/workbook.xml" ContentType="{sheet_type}.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="{sheet_type}.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="{sheet_type}.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="{sheet_type}.styles+xml"/></Types>"#
-        );
+        big.push_str("</mergeCells>");
+        let small = r#"<sheetData><row r="1"><c r="A1" s="1"><v>0.25</v></c></row></sheetData>"#;
         // Incompressible bytes, like a photo, that a grid never needs to inflate.
         let mut seed = 0x2545_F491_4F6C_DD1D_u64;
         let picture: Vec<u8> = (0..4 << 20)
@@ -1298,19 +1882,6 @@ mod tests {
                 seed as u8
             })
             .collect();
-        let parts: Vec<(String, Vec<u8>)> = [
-            ("[Content_Types].xml", content_types.into_bytes()),
-            ("_rels/.rels", root_rels.into_bytes()),
-            ("xl/workbook.xml", workbook.into_bytes()),
-            ("xl/_rels/workbook.xml.rels", workbook_rels.into_bytes()),
-            ("xl/styles.xml", styles.into_bytes()),
-            ("xl/worksheets/sheet1.xml", small.into_bytes()),
-            ("xl/worksheets/sheet2.xml", big.into_bytes()),
-            ("xl/media/image1.png", picture),
-        ]
-        .into_iter()
-        .map(|(name, bytes)| (name.to_string(), bytes))
-        .collect();
-        ooxml_opc::rezip_parts(&parts).unwrap()
+        package(&[small, &big], None, vec![("xl/media/image1.png".into(), picture)])
     }
 }
