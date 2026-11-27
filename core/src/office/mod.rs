@@ -2,7 +2,7 @@
 //! `docx.rs`, `pptx.rs`, `xlsx.rs`; `convert.rs` turns the old binary formats into OOXML first.
 
 pub(crate) mod convert;
-mod docx;
+pub(crate) mod docx;
 pub(crate) mod pptx;
 mod xlsx;
 
