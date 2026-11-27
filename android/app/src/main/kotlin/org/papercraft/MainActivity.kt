@@ -72,8 +72,8 @@ fun App(launchUri: Uri?, themeMode: ThemeMode, onThemeChange: (ThemeMode) -> Uni
     var launching by rememberSaveable { mutableStateOf(launchUri != null) }
 
     suspend fun openUri(uri: Uri) {
-        // Keeps access after restart, if the sending app allows it.
-        runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        // Keeps access after restart (read and write when the provider allows it), if the sending app allows it.
+        context.keepAccess(uri)
         val (f, readable) = withContext(Dispatchers.IO) { context.describe(uri) to context.isReachable(uri) }
         // An unreadable file still opens (the viewer explains why) but stays out of Recent.
         if (readable) recents = store.add(f)
@@ -87,9 +87,11 @@ fun App(launchUri: Uri?, themeMode: ThemeMode, onThemeChange: (ThemeMode) -> Uni
     }
 
     fun openRecent(f: DocFile) = scope.launch {
-        if (withContext(Dispatchers.IO) { context.isReachable(f.uri) }) {
-            recents = store.add(f)
-            file = f
+        // Fresh size, version and write access: the stored ones are from the last time it was opened.
+        val fresh = withContext(Dispatchers.IO) { if (context.isReachable(f.uri)) context.describe(f.uri) else null }
+        if (fresh != null) {
+            recents = store.add(fresh)
+            file = fresh
         } else {
             val result = snackbar.showSnackbar(
                 "Can't open \"${f.name}\". It was moved or deleted.",

@@ -18,7 +18,8 @@ class Recents(private val context: Context) {
         // Give back file access for anything that fell off the list; Android caps how many grants an app keeps.
         val keptUris = kept.mapTo(HashSet()) { it.uri }
         load().filter { it.uri !in keptUris }.forEach {
-            runCatching { context.contentResolver.releasePersistableUriPermission(it.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            val rw = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            runCatching { context.contentResolver.releasePersistableUriPermission(it.uri, rw) }
             Thumbnails.delete(context, it.uri)
         }
         prefs.edit().putString("files", kept.joinToString("\n") { it.encode() }).apply()

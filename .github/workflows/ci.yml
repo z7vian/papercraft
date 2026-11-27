@@ -6,6 +6,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: PDFium for the PDF tests (same pinned release as android/app/build.gradle.kts)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/pdfium.tgz" https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8125/pdfium-linux-x64.tgz
+          echo "e1c3ce6e270cb5e0c20816b379ad9f2c1309972697c505f508de92bf5e7d6659  $RUNNER_TEMP/pdfium.tgz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/pdfium" && tar -xzf "$RUNNER_TEMP/pdfium.tgz" -C "$RUNNER_TEMP/pdfium" lib/libpdfium.so
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/pdfium/lib" >> "$GITHUB_ENV"
       - run: cargo test --manifest-path core/Cargo.toml
 
   android:
@@ -19,6 +25,10 @@ jobs:
       - run: rustup target add aarch64-linux-android x86_64-linux-android
       - run: cargo install cargo-ndk --version 4.1.2 --locked
       - run: sh gradlew assembleDebug # "sh" because Windows commits lose the +x bit
+        working-directory: android
+      - name: Native libraries in the APK
+        run: unzip -l android/app/build/outputs/apk/debug/*.apk | grep '\.so$'
+      - run: sh gradlew testDebugUnitTest
         working-directory: android
       - uses: actions/upload-artifact@v4
         with:

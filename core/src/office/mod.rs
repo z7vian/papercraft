@@ -1,9 +1,9 @@
 //! Word, Excel and PowerPoint files for viewing. One file per format family owns its engine:
 //! `docx.rs`, `pptx.rs`, `xlsx.rs`; `convert.rs` turns the old binary formats into OOXML first.
 
-mod convert;
+pub(crate) mod convert;
 mod docx;
-mod pptx;
+pub(crate) mod pptx;
 mod xlsx;
 
 use std::sync::Arc;
@@ -32,6 +32,10 @@ trait Pages {
     fn render(&self, index: u32, scale: f32) -> Result<Option<Vec<u8>>, CoreError>;
     /// The page's text in reading order, for search; `None` past the last page.
     fn page_text(&self, index: u32) -> Result<Option<String>, CoreError>;
+    /// The page's speaker notes; `None` when it has none, past the last page, or for formats without notes.
+    fn notes(&self, _index: u32) -> Result<Option<String>, CoreError> {
+        Ok(None)
+    }
 }
 
 /// A Word, Excel or PowerPoint file, opened once and drawn one page at a time.
@@ -99,8 +103,7 @@ impl OfficeDoc {
         Ok(Arc::new(Self { jobs, page_count, page_names }))
     }
 
-    /// `None` for documents: their page count is known only after layout, so draw pages until
-    /// [`Self::render_page`] returns `None`.
+    /// Pages, slides or sheets in the file. Documents count theirs from the layout made at open.
     pub fn page_count(&self) -> Option<u32> {
         self.page_count
     }
@@ -118,5 +121,10 @@ impl OfficeDoc {
     /// The page's text in reading order, for search; `None` past the last page.
     pub fn page_text(&self, index: u32) -> Result<Option<String>, CoreError> {
         self.ask(move |doc| doc.page_text(index))
+    }
+
+    /// The slide's speaker notes; `None` when it has none, past the last slide, or for documents and workbooks.
+    pub fn notes(&self, index: u32) -> Result<Option<String>, CoreError> {
+        self.ask(move |doc| doc.notes(index))
     }
 }
