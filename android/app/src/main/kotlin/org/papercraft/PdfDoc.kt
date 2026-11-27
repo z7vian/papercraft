@@ -2,58 +2,51 @@ package org.papercraft
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.pdf.PdfRenderer
 import android.net.Uri
-import android.os.ParcelFileDescriptor
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.papercraft.core.CoreException
+import org.papercraft.core.PdfFile
+import org.papercraft.core.PdfHit
+import org.papercraft.core.PdfPageSize
 import java.io.FileNotFoundException
-import kotlin.math.sqrt
+import java.nio.ByteBuffer
 
-class PasswordProtectedException : Exception("This PDF is password-protected. Password support is coming later.")
+/** The PDF is locked: ask for its password and call [PdfDoc.open] again. [wrongPassword] is true when the one given didn't fit. */
+class PasswordProtectedException(val wrongPassword: Boolean) :
+    Exception(if (wrongPassword) "That password doesn't open this PDF." else "This PDF is password-protected. Password support is coming later.")
 
-/** Android's built-in PDF renderer. It's not thread-safe, so every call goes through one lock. */
-class PdfDoc private constructor(fd: ParcelFileDescriptor) : Pages {
-    private val renderer = PdfRenderer(fd) // takes ownership of fd
-    private val lock = Mutex()
-    private var closed = false
-    override val pageCount = renderer.pageCount
+/** A PDF drawn by PDFium in the Rust core, the same on every Android version. The core runs one PDFium call at a time. */
+class PdfDoc private constructor(private val file: PdfFile) : Pages {
+    override val pageCount = file.pageCount().toInt()
 
-    override suspend fun render(index: Int, width: Int): Bitmap? = lock.withLock {
-        if (closed) return null
-        withContext(Dispatchers.IO) {
-            renderer.openPage(index).use { page ->
-                // Limit: max 16 MP (64 MB) per page, under Android's 100 MB draw limit; tile very tall pages to make them sharper.
-                val w = minOf(width.toDouble(), sqrt(16e6 * page.width / page.height)).toInt().coerceAtLeast(1)
-                val h = (w.toLong() * page.height / page.width).toInt().coerceAtLeast(1)
-                Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
-                    it.eraseColor(android.graphics.Color.WHITE)
-                    page.render(it, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                }
-            }
-        }
+    override suspend fun render(index: Int, width: Int): Bitmap? = withContext(Dispatchers.IO) {
+        val img = file.render(index.toUInt(), width.toUInt()) ?: return@withContext null
+        Bitmap.createBitmap(img.width.toInt(), img.height.toInt(), Bitmap.Config.ARGB_8888)
+            .apply { copyPixelsFromBuffer(ByteBuffer.wrap(img.pixels)) }
     }
 
-    override fun closeLater() {
-        CoroutineScope(Dispatchers.IO).launch { lock.withLock { closed = true; renderer.close() } }
-    }
+    /** Page [index]'s size in points as drawn, or null past the last page. */
+    fun pageSize(index: Int): PdfPageSize? = file.pageSize(index.toUInt())
+
+    /** Page [index]'s text, or null past the last page. */
+    suspend fun pageText(index: Int): String? = withContext(Dispatchers.IO) { file.pageText(index.toUInt()) }
+
+    /** Every case-insensitive match of [query]; boxes are in points from the page's top-left corner, like [pageSize]. */
+    suspend fun search(query: String): List<PdfHit> = withContext(Dispatchers.IO) { file.search(query) }
+
+    override fun closeLater() = file.close()
 
     companion object {
-        /** Blocking. PdfRenderer throws SecurityException for a password-protected file. */
-        fun open(context: Context, uri: Uri): PdfDoc {
-            val fd = context.contentResolver.openFileDescriptor(uri, "r") ?: throw FileNotFoundException()
+        /** Blocking: reads the whole file. Throws [PasswordProtectedException] when [password] is missing or wrong. */
+        fun open(context: Context, uri: Uri, password: String? = null): PdfDoc {
+            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: throw FileNotFoundException()
             return try {
-                PdfDoc(fd)
-            } catch (e: SecurityException) {
-                fd.close()
-                throw PasswordProtectedException()
-            } catch (t: Throwable) {
-                fd.close()
-                throw t
+                PdfDoc(PdfFile.open(bytes, password))
+            } catch (e: CoreException.PasswordRequired) {
+                throw PasswordProtectedException(wrongPassword = false)
+            } catch (e: CoreException.WrongPassword) {
+                throw PasswordProtectedException(wrongPassword = true)
             }
         }
     }
