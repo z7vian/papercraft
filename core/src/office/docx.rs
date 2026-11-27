@@ -2,16 +2,19 @@
 //! retained layout, so drawing page N costs one page, not the whole document.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use betteroffice_docx::fonts::{FontLoading, FontManager, FontSource, LastResortOffice, embedded_font_definitions};
 use docx_edit::EngineSession;
-use docx_layout::display_list::{DisplayList, PARAGRAPH_MARK_FACE, Primitive, TextRunPrimitive};
+use docx_layout::display_list::{
+    BorderOwner, DisplayList, DisplayPage, DocAttrs, PARAGRAPH_MARK_FACE, Primitive, TextRunPrimitive,
+    UnreadableDisplayInput,
+};
 use docx_layout::measure_blocks::FontRequirement;
 use docx_raster::{FontChains, GlyphCache, ImageCache, ImageMap, RenderResources, RenderedPage};
 use ooxml_text::{FontId, FontStore};
-use serde_json::{Value, json};
+use serde_json::{Number, Value, json};
 
 use super::{Pages, bad};
 use crate::CoreError;
@@ -27,6 +30,10 @@ pub(super) struct Words {
     fonts: RefCell<Fonts>,
     /// Glyph outlines and decoded pictures, kept so later pages reuse what earlier ones extracted.
     caches: RefCell<(GlyphCache, ImageCache)>,
+    /// The blocks each page places, read from the retained layout the first time page text needs them.
+    blocks: OnceCell<Vec<PageBlocks>>,
+    /// How many blocks of a page the display-list conversion could not read, by page, once a page was read.
+    skipped: RefCell<HashMap<usize, u32>>,
 }
 
 impl Words {
@@ -63,19 +70,48 @@ impl Words {
             layout_chains,
             fonts: RefCell::new(fonts),
             caches: RefCell::new((GlyphCache::default(), ImageCache::default())),
+            blocks: OnceCell::new(),
+            skipped: RefCell::new(HashMap::new()),
         })
     }
 
     /// The retained layout's display list with only `page` built.
     fn page_list(&self, page: usize) -> Result<DisplayList, CoreError> {
         let mut fonts = self.fonts.borrow_mut();
-        // Limit: content the display-list conversion can't read is left off the page (the engine's own renderer
-        // then lays the whole file out again through a save); reporting it to the viewer lifts it.
+        // Content the display-list conversion can't read is left off the page; `Pages::skipped_on_page` counts it.
         let (list, _unreadable) = docx_layout::with_measure_font_store(&mut fonts.store, || {
             self.engine.retained_page_display_list(&self.layout_chains, page)
         })
         .map_err(|e| bad("document", e))?;
         Ok(list)
+    }
+
+    /// The retained layout's display list with only `page` built and its text left unshaped, since reading text
+    /// needs no glyphs; with how many of the page's blocks the conversion could not read.
+    fn text_list(&self, page: usize) -> Result<(DisplayList, u32), CoreError> {
+        let (list, unreadable) =
+            self.engine.retained_page_display_list(&BTreeMap::new(), page).map_err(|e| bad("document", e))?;
+        let skipped = unreadable_on(self.page_blocks()?.get(page), page, &unreadable);
+        self.skipped.borrow_mut().insert(page, skipped);
+        Ok((list, skipped))
+    }
+
+    /// The blocks each page of the retained layout places.
+    fn page_blocks(&self) -> Result<&[PageBlocks], CoreError> {
+        if self.blocks.get().is_none() {
+            let layout = self.engine.retained_layout_json().map_err(|e| bad("document", e))?;
+            let blocks = page_blocks(&layout).map_err(|e| bad("document", e))?;
+            let _ = self.blocks.set(blocks);
+        }
+        Ok(self.blocks.get().map_or(&[], Vec::as_slice))
+    }
+
+    /// The body text the engine reads for page `index`: body paragraphs and table cells, one per line.
+    fn body_text(&self, index: u32) -> Result<String, CoreError> {
+        let texts = self.engine.page_texts_json(&[index as usize]).map_err(|e| bad("document", e))?;
+        let texts: Value = serde_json::from_str(&texts).map_err(|e| bad("document", e))?;
+        let paragraphs = texts[0]["paragraphs"].as_array().into_iter().flatten();
+        Ok(paragraphs.filter_map(|paragraph| paragraph["text"].as_str()).collect::<Vec<_>>().join("\n"))
     }
 
     /// Page `index` drawn at `scale`, with what it could not draw; `None` past the last page.
@@ -108,17 +144,221 @@ impl Pages for Words {
         Ok(self.draw(index, scale)?.map(|page| page.bytes))
     }
 
-    // Limit: headers, footers, text boxes and notes are not read (the engine's page text covers body paragraphs and
-    // tables); collecting the text runs of those display-list regions lifts it.
+    /// Headers first, then the body, text boxes in position order, notes, and footers; one paragraph per line.
     fn page_text(&self, index: u32) -> Result<Option<String>, CoreError> {
         if index >= self.pages {
             return Ok(None);
         }
-        let texts = self.engine.page_texts_json(&[index as usize]).map_err(|e| bad("document", e))?;
-        let texts: Value = serde_json::from_str(&texts).map_err(|e| bad("document", e))?;
-        let paragraphs = texts[0]["paragraphs"].as_array().into_iter().flatten();
-        Ok(Some(paragraphs.filter_map(|paragraph| paragraph["text"].as_str()).collect::<Vec<_>>().join("\n")))
+        let page = index as usize;
+        let body = self.body_text(index)?;
+        let (list, _) = self.text_list(page)?;
+        let Some(shown) = list.pages.get(page) else {
+            return Ok(Some(body));
+        };
+        let no_blocks = PageBlocks::default();
+        let blocks = self.page_blocks()?.get(page).unwrap_or(&no_blocks);
+        let mut parts: Vec<String> = shown.header.iter().flat_map(|band| region_texts(&band.primitives)).collect();
+        if !body.is_empty() {
+            parts.push(body);
+        }
+        parts.extend(text_box_texts(shown, &blocks.body));
+        parts.extend(shown.note_areas.iter().flat_map(|area| region_texts(&area.primitives)));
+        parts.extend(shown.footer.iter().flat_map(|band| region_texts(&band.primitives)));
+        Ok(Some(parts.join("\n")))
     }
+
+    fn skipped_on_page(&self, index: u32) -> Result<u32, CoreError> {
+        if index >= self.pages {
+            return Ok(0);
+        }
+        let page = index as usize;
+        if let Some(&skipped) = self.skipped.borrow().get(&page) {
+            return Ok(skipped);
+        }
+        Ok(self.text_list(page)?.1)
+    }
+}
+
+/// The blocks one page of the layout places, by their display key.
+#[derive(Default)]
+struct PageBlocks {
+    /// Body paragraphs and tables: the blocks whose text the engine's page text reads.
+    body: HashSet<String>,
+    /// Every block with a fragment on the page.
+    all: HashSet<String>,
+}
+
+/// The blocks each page of a retained layout (`{"layout":{"pages":[{"fragments":[…]}]}}`) places.
+fn page_blocks(layout: &str) -> Result<Vec<PageBlocks>, serde_json::Error> {
+    let reply: Value = serde_json::from_str(layout)?;
+    let pages = reply["layout"]["pages"].as_array().into_iter().flatten();
+    Ok(pages
+        .map(|page| {
+            let mut blocks = PageBlocks::default();
+            for fragment in page["fragments"].as_array().into_iter().flatten() {
+                let key = match &fragment["blockId"] {
+                    Value::String(key) => key.clone(),
+                    Value::Number(id) => number_key(id),
+                    _ => continue,
+                };
+                if matches!(fragment["kind"].as_str(), Some("paragraph" | "table")) {
+                    blocks.body.insert(key.clone());
+                }
+                blocks.all.insert(key);
+            }
+            blocks
+        })
+        .collect())
+}
+
+/// A numeric block id as the display list keys it: an integral number reads as an integer.
+fn number_key(id: &Number) -> String {
+    match id.as_f64() {
+        Some(id) if id.fract() == 0.0 && id.abs() <= i64::MAX as f64 => (id as i64).to_string(),
+        _ => id.to_string(),
+    }
+}
+
+/// How many blocks of `page` the display-list conversion could not read: fragments it left off the page, and blocks
+/// it could not read at all that the page places.
+fn unreadable_on(blocks: Option<&PageBlocks>, page: usize, unreadable: &[UnreadableDisplayInput]) -> u32 {
+    let on_page = unreadable.iter().filter(|entry| match entry.page {
+        Some(on) => on == page,
+        None => blocks.is_some_and(|blocks| blocks.all.contains(&entry.block)),
+    });
+    let blocks: HashSet<&str> = on_page.map(|entry| entry.block.as_str()).collect();
+    u32::try_from(blocks.len()).unwrap_or(u32::MAX)
+}
+
+/// A run of text a page paints, and where.
+struct Piece<'a> {
+    text: &'a str,
+    /// The display key of the paragraph it belongs to.
+    paragraph: Option<String>,
+    left: f64,
+    right: f64,
+    baseline: f64,
+}
+
+/// The text `primitive` paints, with its attributes. List markers and hidden text are left out, as the engine's
+/// body text leaves them out.
+fn piece(primitive: &Primitive) -> Option<(Piece<'_>, &DocAttrs)> {
+    let (text, attrs, hidden, left, right, baseline) = match primitive {
+        Primitive::Text(run) => {
+            let left = px(&run.x);
+            (run.text.as_str(), &run.attrs, run.hidden, left, left + px(&run.width), px(&run.baseline_y))
+        }
+        Primitive::GlyphRun(run) => {
+            let (left, baseline) = run.glyphs.first().map_or((0.0, 0.0), |glyph| (glyph.x, glyph.y));
+            let right = run.glyphs.last().map_or(left, |glyph| glyph.x + glyph.advance);
+            (run.text.as_str(), &run.attrs, run.hidden, left, right, baseline)
+        }
+        _ => return None,
+    };
+    if text.is_empty() || hidden || attrs.list_marker == Some(true) {
+        return None;
+    }
+    let paragraph = attrs.block_key.clone().or_else(|| attrs.block_id.as_ref().map(number_key));
+    Some((Piece { text, paragraph, left, right, baseline }, attrs))
+}
+
+fn px(value: &Number) -> f64 {
+    value.as_f64().unwrap_or(0.0)
+}
+
+/// Baselines closer than this sit on one line.
+const SAME_LINE: f64 = 1.0;
+/// A wider space between two runs of one line is a tab stop.
+const TAB_GAP: f64 = 2.0;
+
+/// The paragraphs `pieces` spell, in their order, one string each; whitespace-only paragraphs are left out. Runs of
+/// one paragraph join as they are on a line, with a tab across a gap, and with a space across a line break.
+fn paragraph_texts<'a>(pieces: impl IntoIterator<Item = Piece<'a>>) -> Vec<String> {
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut last: Option<Piece<'a>> = None;
+    for piece in pieces {
+        let separator = match &last {
+            Some(previous) if previous.paragraph == piece.paragraph => {
+                let same_line = (piece.baseline - previous.baseline).abs() < SAME_LINE;
+                Some(if !same_line {
+                    Some(' ')
+                } else if piece.left - previous.right > TAB_GAP {
+                    Some('\t')
+                } else {
+                    None
+                })
+            }
+            _ => None,
+        };
+        match (separator, paragraphs.last_mut()) {
+            (Some(separator), Some(text)) => {
+                if let Some(separator) = separator
+                    && !text.ends_with(char::is_whitespace)
+                    && !piece.text.starts_with(char::is_whitespace)
+                {
+                    text.push(separator);
+                }
+                text.push_str(piece.text);
+            }
+            _ => paragraphs.push(piece.text.to_owned()),
+        }
+        last = Some(piece);
+    }
+    paragraphs.retain(|text| text.chars().any(|c| !c.is_whitespace()));
+    paragraphs
+}
+
+/// The paragraphs a header, footer or note area paints.
+fn region_texts(primitives: &[Primitive]) -> Vec<String> {
+    paragraph_texts(primitives.iter().filter_map(|primitive| piece(primitive).map(|(piece, _)| piece)))
+}
+
+/// The paragraphs of the text boxes and shapes `page` paints in its body, box by box from the top and then from the
+/// left. Text belongs to a box when it sits in an inline shape, or outside table cells in a paragraph the page's body
+/// does not place (`body`); a box starts at its shape or border, else at its first text.
+// Limit: a shape placed as a block of a table cell reads as cell text, which the engine's body text leaves out; telling
+// it apart by the `shape-text` clip group the display list stamps on grouped shape text lifts it.
+fn text_box_texts(page: &DisplayPage, body: &HashSet<String>) -> Vec<String> {
+    let mut boxes: Vec<((f64, f64), Vec<Piece<'_>>)> = Vec::new();
+    // Whether the last box takes the next text, and where the next box starts when a container opened it.
+    let mut open = false;
+    let mut origin: Option<(f64, f64)> = None;
+    let watermark = page.watermark_primitive_count.unwrap_or(0);
+    for primitive in page.primitives.iter().skip(watermark) {
+        match primitive {
+            Primitive::Shape(shape) => {
+                open = false;
+                origin = Some((px(&shape.y), px(&shape.x)));
+                continue;
+            }
+            Primitive::Line(line) if line.border_owner == Some(BorderOwner::TextBox) => {
+                open = false;
+                origin = Some((px(&line.y1), px(&line.x1)));
+                continue;
+            }
+            _ => {}
+        }
+        let Some((piece, attrs)) = piece(primitive) else {
+            continue;
+        };
+        let in_box = attrs.inline_shape_atom == Some(true)
+            || (attrs.cell.is_none() && piece.paragraph.as_ref().is_some_and(|key| !body.contains(key)));
+        if !in_box {
+            open = false;
+            origin = None;
+            continue;
+        }
+        match boxes.last_mut() {
+            Some((_, pieces)) if open => pieces.push(piece),
+            _ => {
+                let at = origin.take().unwrap_or((piece.baseline, piece.left));
+                boxes.push((at, vec![piece]));
+                open = true;
+            }
+        }
+    }
+    boxes.sort_by(|(a, _), (b, _)| a.0.round().total_cmp(&b.0.round()).then(a.1.total_cmp(&b.1)));
+    boxes.into_iter().flat_map(|(_, pieces)| paragraph_texts(pieces)).collect()
 }
 
 /// The package fields the region layout request reads.
@@ -521,16 +761,30 @@ mod tests {
             .unwrap();
     }
 
-    fn open(name: &str) -> Words {
-        let path = format!("{}/tests/fixtures/docx/{name}", env!("CARGO_MANIFEST_DIR"));
+    /// Opens a fixture by its path under `tests/fixtures`.
+    fn open(path: &str) -> Words {
+        let path = format!("{}/tests/fixtures/{path}", env!("CARGO_MANIFEST_DIR"));
         Words::open(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// Where `needle` starts in `text`; fails with the whole text when it is missing.
+    fn at(text: &str, needle: &str) -> usize {
+        text.find(needle).unwrap_or_else(|| panic!("{needle:?} is missing from:\n{text}"))
+    }
+
+    /// Page `index`'s text, checked to hold the engine's body text unchanged, whole and in one piece.
+    fn page_text_around_body(doc: &Words, index: u32) -> (String, String) {
+        let text = doc.page_text(index).unwrap().unwrap();
+        let body = doc.body_text(index).unwrap();
+        assert!(text.contains(&body), "page {index} lost its body text {body:?}:\n{text}");
+        (text, body)
     }
 
     // Bug51170.docx: Apache POI test-data (Apache License 2.0).
     #[test]
     fn bug51170_lays_out_once_and_draws_its_header_picture() {
         on_engine_stack(|| {
-            let doc = open("Bug51170.docx");
+            let doc = open("docx/Bug51170.docx");
             assert_eq!(doc.page_count(), Some(7));
             let first = doc.page_text(0).unwrap().unwrap();
             assert!(first.contains("CONSELHO NACIONAL DA INDUSTRIA DO GOLFE"), "{first}");
@@ -557,7 +811,7 @@ mod tests {
     #[test]
     fn word_with_attachments_draws_both_pages_and_their_metafiles() {
         on_engine_stack(|| {
-            let doc = open("WordWithAttachments.docx");
+            let doc = open("docx/WordWithAttachments.docx");
             assert_eq!(doc.page_count(), Some(2));
             let first = doc.page_text(0).unwrap().unwrap();
             assert!(first.contains("Русский вариант"), "{first}");
@@ -584,5 +838,172 @@ mod tests {
         // Alternate content around a whole drawing is the engine's to resolve.
         let run = r#"<w:r xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing/></mc:Choice><mc:Fallback><w:pict/></mc:Fallback></mc:AlternateContent></w:r>"#;
         assert_eq!(resolve_alternates_in_pictures(run), None);
+    }
+
+    // DiffFirstPageHeadFoot.docx: Apache POI test-data (Apache License 2.0). Its first page has its own header and
+    // footer; the second page's spread over three tab stops.
+    #[test]
+    fn headers_and_footers_read_on_their_own_pages_around_the_body() {
+        on_engine_stack(|| {
+            let doc = open("wordtext/DiffFirstPageHeadFoot.docx");
+            assert_eq!(doc.page_count(), Some(2));
+            let laid_out = doc.engine.stats();
+
+            let (first, body) = page_text_around_body(&doc, 0);
+            assert!(body.contains("This is a sample word document."), "{body}");
+            assert!(!body.contains("I am the header"), "the engine's body text now reads the header:\n{body}");
+            let header = at(&first, "I am the header on the first page, and I’m nice and simple");
+            let footer = at(&first, "The footer of the first page");
+            assert!(header < at(&first, &body) && at(&first, &body) < footer, "{first}");
+            assert!(!first.contains("Mid header") && !first.contains("Footer Middle"), "{first}");
+
+            let (second, body) = page_text_around_body(&doc, 1);
+            assert!(body.contains("This is page two"), "{body}");
+            let header = at(&second, "First header column!");
+            assert!(header < at(&second, "Mid header") && at(&second, "Mid header") < at(&second, "Right header!"));
+            let footer = at(&second, "Footer Left");
+            assert!(header < at(&second, &body) && at(&second, &body) < footer, "{second}");
+            assert!(second.ends_with("Footer Right"), "{second}");
+            assert!(!second.contains("first page"), "{second}");
+
+            let read = doc.engine.stats();
+            assert_eq!(read.pagination_calls, laid_out.pagination_calls, "reading text laid the document out again");
+            assert_eq!(read.layout_epoch, laid_out.layout_epoch, "reading text laid the document out again");
+        });
+    }
+
+    // footnotes.docx: Apache POI test-data (Apache License 2.0).
+    #[test]
+    fn a_footnote_reads_after_the_body_of_its_page() {
+        on_engine_stack(|| {
+            let doc = open("wordtext/footnotes.docx");
+            let (text, body) = page_text_around_body(&doc, 0);
+            assert!(body.contains("Eto ochen prostoy text so snoskoy"), "{body}");
+            assert!(!body.contains("snoska"), "{body}");
+            assert!(at(&text, &body) < at(&text, "snoska"), "{text}");
+        });
+    }
+
+    // endnotes.docx: Apache POI test-data (Apache License 2.0).
+    #[test]
+    fn an_endnote_reads_on_the_last_page_only() {
+        on_engine_stack(|| {
+            let doc = open("wordtext/endnotes.docx");
+            let last = doc.page_count().unwrap() - 1;
+            for page in 0..last {
+                let (text, _) = page_text_around_body(&doc, page);
+                assert!(!text.contains("XXX"), "page {page} reads the endnote:\n{text}");
+            }
+            let (text, body) = page_text_around_body(&doc, last);
+            assert!(!body.contains("XXX"), "{body}");
+            assert!(at(&text, &body) < at(&text, "XXX"), "{text}");
+        });
+    }
+
+    // shapes-with-text.docx: Apache POI test-data (Apache License 2.0). A text box, a rectangle and an ellipse with
+    // text, and a group whose shapes hold text, each anchored to an empty paragraph and saved with VML fallbacks.
+    #[test]
+    fn text_boxes_and_shapes_read_once_each_from_the_top() {
+        on_engine_stack(|| {
+            let doc = open("wordtext/shapes-with-text.docx");
+            let text = doc.page_text(0).unwrap().unwrap();
+            let boxes = [
+                "Floating text box",
+                "An ellipse with text inside",
+                "A square shape with text inside",
+                "A group of shapes",
+                "Where some contain text",
+            ];
+            for text_box in boxes {
+                assert_eq!(text.matches(text_box).count(), 1, "{text_box:?} does not read once:\n{text}");
+            }
+            let starts: Vec<usize> = boxes[..4].iter().map(|text_box| at(&text, text_box)).collect();
+            assert!(starts.is_sorted(), "boxes out of position order:\n{text}");
+        });
+    }
+
+    // WordWithAttachments.docx: Apache POI test-data (Apache License 2.0). A VML text box sits beside the first page's
+    // body text.
+    #[test]
+    fn a_vml_text_box_reads_after_the_body_of_its_page() {
+        on_engine_stack(|| {
+            let doc = open("docx/WordWithAttachments.docx");
+            let (text, body) = page_text_around_body(&doc, 0);
+            assert!(body.contains("Русский вариант"), "{body}");
+            assert!(!body.contains("Словарь"), "{body}");
+            let text_box = at(&text, "Словарь");
+            assert!(at(&text, &body) < text_box, "{text}");
+            assert!(text_box < at(&text, "dictionary") && at(&text, "dictionary") < at(&text, "Луғат"), "{text}");
+        });
+    }
+
+    /// What the display-list conversion could not read on `page`, for failure messages.
+    fn unreadable(doc: &Words, page: usize) -> Vec<String> {
+        let (_, unreadable) = doc.engine.retained_page_display_list(&BTreeMap::new(), page).unwrap();
+        unreadable.iter().map(|entry| format!("{} on {:?}: {}", entry.block, entry.page, entry.reason)).collect()
+    }
+
+    // drawing.docx: Apache POI test-data (Apache License 2.0); betteroffice-demo.docx: the betteroffice-docx 0.6.0 test
+    // corpus (Apache-2.0).
+    #[test]
+    fn fixture_pages_convert_whole() {
+        on_engine_stack(|| {
+            for path in [
+                "docx/Bug51170.docx",
+                "docx/WordWithAttachments.docx",
+                "doc_edit/betteroffice-demo.docx",
+                "wordtext/DiffFirstPageHeadFoot.docx",
+                "wordtext/drawing.docx",
+                "wordtext/shapes-with-text.docx",
+            ] {
+                let doc = open(path);
+                for page in 0..doc.page_count().unwrap() {
+                    let skipped = doc.skipped_on_page(page).unwrap();
+                    assert_eq!(skipped, 0, "{path} page {page}: {:?}", unreadable(&doc, page as usize));
+                }
+                assert_eq!(doc.skipped_on_page(doc.pages).unwrap(), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn skipped_blocks_count_once_on_the_pages_that_place_them() {
+        let blocks = PageBlocks { body: HashSet::new(), all: ["p1", "t2"].map(String::from).into() };
+        let entry = |block: &str, page| UnreadableDisplayInput { block: block.into(), page, reason: String::new() };
+        let unreadable = [
+            // A block it could not read at all, placed on the page.
+            entry("t2", None),
+            // The same block's fragment on the page counts with it.
+            entry("t2", Some(3)),
+            // Fragments left off this page and another.
+            entry("p9", Some(3)),
+            entry("p1", Some(4)),
+            // A block placed elsewhere.
+            entry("s5", None),
+        ];
+        assert_eq!(unreadable_on(Some(&blocks), 3, &unreadable), 2);
+        assert_eq!(unreadable_on(None, 4, &unreadable), 1);
+        assert_eq!(unreadable_on(Some(&blocks), 5, &unreadable), 1);
+    }
+
+    #[test]
+    fn paragraph_pieces_join_as_the_page_shows_them() {
+        let piece = |text, paragraph: &str, left: f64, right: f64, baseline: f64| Piece {
+            text,
+            paragraph: Some(paragraph.to_owned()),
+            left,
+            right,
+            baseline,
+        };
+        let pieces = [
+            piece("Left", "a", 0.0, 30.0, 10.0),
+            piece("Middle", "a", 100.0, 150.0, 10.0),
+            piece("Right", "a", 150.0, 190.0, 10.0),
+            piece("wrapped", "a", 0.0, 50.0, 25.0),
+            piece("Next ", "b", 0.0, 40.0, 40.0),
+            piece("line", "b", 0.0, 30.0, 55.0),
+            piece("  ", "c", 0.0, 10.0, 70.0),
+        ];
+        assert_eq!(paragraph_texts(pieces), ["Left\tMiddleRight wrapped", "Next line"]);
     }
 }
