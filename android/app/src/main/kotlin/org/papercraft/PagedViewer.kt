@@ -1,10 +1,6 @@
 package org.papercraft
 
-import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.pdf.PdfRenderer
-import android.net.Uri
-import android.os.ParcelFileDescriptor
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -14,6 +10,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
@@ -36,6 +33,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,66 +50,29 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import java.io.FileNotFoundException
 import kotlin.math.ceil
-import kotlin.math.sqrt
 
-class PasswordProtectedException : Exception("This PDF is password-protected. Password support is coming later.")
+/** A file shown as a column of drawn pages: PDF pages, document pages, slides or sheets. */
+interface Pages {
+    /** Null when only drawing reveals it (Word documents): pages then appear until [render] returns null. */
+    val pageCount: Int?
 
-/** Android's built-in PDF renderer. It's not thread-safe, so every call goes through one lock. */
-class PdfDoc private constructor(fd: ParcelFileDescriptor) {
-    private val renderer = PdfRenderer(fd) // takes ownership of fd
-    private val lock = Mutex()
-    private var closed = false
-    val pageCount = renderer.pageCount
+    /** A caption shown above each page (sheet names), or null for none. */
+    fun title(index: Int): String? = null
 
-    suspend fun render(index: Int, width: Int): Bitmap? = lock.withLock {
-        if (closed) return null
-        withContext(Dispatchers.IO) {
-            renderer.openPage(index).use { page ->
-                // Limit: max 16 MP (64 MB) per page, under Android's 100 MB draw limit; tile very tall pages to make them sharper.
-                val w = minOf(width.toDouble(), sqrt(16e6 * page.width / page.height)).toInt().coerceAtLeast(1)
-                val h = (w.toLong() * page.height / page.width).toInt().coerceAtLeast(1)
-                Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
-                    it.eraseColor(android.graphics.Color.WHITE)
-                    page.render(it, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                }
-            }
-        }
-    }
+    /** Page [index] about [width] pixels wide, or null past the last page. */
+    suspend fun render(index: Int, width: Int): Bitmap?
 
-    /** Closes once any page render in flight has finished. */
-    fun closeLater() {
-        CoroutineScope(Dispatchers.IO).launch { lock.withLock { closed = true; renderer.close() } }
-    }
-
-    companion object {
-        /** Blocking. PdfRenderer throws SecurityException for a password-protected file. */
-        fun open(context: Context, uri: Uri): PdfDoc {
-            val fd = context.contentResolver.openFileDescriptor(uri, "r") ?: throw FileNotFoundException()
-            return try {
-                PdfDoc(fd)
-            } catch (e: SecurityException) {
-                fd.close()
-                throw PasswordProtectedException()
-            } catch (t: Throwable) {
-                fd.close()
-                throw t
-            }
-        }
-    }
+    /** Frees the file once any render in flight has finished. */
+    fun closeLater()
 }
 
 @Composable
-fun PdfViewer(doc: PdfDoc) {
+fun PagedViewer(doc: Pages) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val screenWidth = maxWidth
         var zoom by remember { mutableFloatStateOf(1f) }
@@ -121,6 +82,8 @@ fun PdfViewer(doc: PdfDoc) {
         val list = rememberLazyListState()
         // Page shapes we've seen, so pages don't jump size as they scroll back in.
         val aspects = remember(doc) { mutableStateMapOf<Int, Float>() }
+        var lastPage by remember(doc) { mutableStateOf(doc.pageCount) }
+        var shown by remember(doc) { mutableIntStateOf(doc.pageCount ?: 1) }
 
         // Limit: zoom keeps the left edge fixed; zoom around the fingers later.
         Box(
@@ -135,21 +98,36 @@ fun PdfViewer(doc: PdfDoc) {
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 96.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                items(doc.pageCount) { i ->
+                items(shown) { i ->
                     var page by remember { mutableStateOf<ImageBitmap?>(null) }
                     LaunchedEffect(renderWidth) {
                         // A broken page shows blank instead of crashing the app.
-                        runCatching { doc.render(i, renderWidth) }.getOrNull()?.let {
+                        val bitmap = runCatching { doc.render(i, renderWidth) }
+                        bitmap.getOrNull()?.let {
                             page = it.asImageBitmap()
                             aspects[i] = it.width.toFloat() / it.height
+                            if (lastPage == null) shown = maxOf(shown, i + 2)
+                        }
+                        if (bitmap.isSuccess && bitmap.getOrNull() == null && lastPage == null) {
+                            lastPage = i
+                            shown = i
                         }
                     }
                     val aspect = aspects[i] ?: aspects[0] ?: (1 / 1.414f) // A4 until we know better
-                    Box(
-                        Modifier.fillMaxWidth().aspectRatio(aspect).shadow(2.dp).background(Color.White)
-                            .semantics { contentDescription = "Page ${i + 1} of ${doc.pageCount}" },
-                    ) {
-                        page?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        doc.title(i)?.let {
+                            Text(
+                                it, Modifier.semantics { heading() },
+                                style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Box(
+                            Modifier.fillMaxWidth().aspectRatio(aspect).shadow(2.dp).background(Color.White)
+                                .semantics { contentDescription = "Page ${i + 1}" + (lastPage?.let { " of $it" } ?: "") },
+                        ) {
+                            page?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
+                        }
                     }
                 }
             }
@@ -160,10 +138,11 @@ fun PdfViewer(doc: PdfDoc) {
             derivedStateOf {
                 val info = list.layoutInfo
                 val middle = (info.viewportStartOffset + info.viewportEndOffset) / 2
-                if (!list.canScrollForward && list.canScrollBackward) doc.pageCount
+                if (!list.canScrollForward && list.canScrollBackward) shown
                 else (info.visibleItemsInfo.lastOrNull { it.offset <= middle }?.index ?: 0) + 1
             }
         }
+        val total = lastPage?.toString() ?: "…"
         Surface(
             Modifier.align(Alignment.BottomCenter).padding(16.dp),
             shape = CircleShape,
@@ -175,8 +154,10 @@ fun PdfViewer(doc: PdfDoc) {
                     Icon(painterResource(R.drawable.ic_zoom_out), "Zoom out")
                 }
                 Text(
-                    "$current / ${doc.pageCount}",
-                    Modifier.padding(horizontal = 4.dp).clearAndSetSemantics { contentDescription = "Page $current of ${doc.pageCount}" },
+                    "$current / $total",
+                    Modifier.padding(horizontal = 4.dp).clearAndSetSemantics {
+                        contentDescription = "Page $current" + (lastPage?.let { " of $it" } ?: "")
+                    },
                     style = MaterialTheme.typography.labelLarge,
                 )
                 IconButton({ zoom = (zoom * 1.5f).coerceAtMost(4f) }, enabled = zoom < 4f) {

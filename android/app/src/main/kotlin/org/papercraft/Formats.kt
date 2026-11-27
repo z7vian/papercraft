@@ -32,21 +32,29 @@ enum class Category(val label: String, val color: Color, val exts: Set<String>) 
 }
 
 /**
- * How a file is shown. [noun] names what it opens, for the home screen hint (listed in this order).
+ * How a file is shown. [nouns] name what it opens, for the home screen hint (listed in this order).
  * The "open with" intent filter in AndroidManifest.xml lists the MIME types of these extensions.
  */
-enum class Viewer(val exts: Set<String>, val noun: String, val darkBackdrop: Boolean = false) {
-    Pdf(setOf("pdf"), "PDF", darkBackdrop = true),
-    Image(setOf("jpg", "jpeg", "png", "bmp"), "picture", darkBackdrop = true),
-    Tiff(setOf("tif", "tiff"), "picture", darkBackdrop = true),
-    Table(setOf("csv"), "CSV spreadsheet"),
-    Text(setOf("txt"), "text file"),
-    Web(setOf("html", "htm"), "web page"),
-    WebArchive(setOf("mht", "mhtml"), "saved web page"),
+enum class Viewer(val exts: Set<String>, val nouns: List<String>, val darkBackdrop: Boolean = false) {
+    Office(
+        setOf(
+            "docx", "docm", "dotx", "dotm", "doc", "dot", "wps", "wpt",
+            "xlsx", "xlsm", "xltx", "xltm", "xlam", "xls", "xlt", "xla", "et", "ett",
+            "pptx", "pptm", "potx", "potm", "ppsx", "ppsm", "ppt", "pot", "pps", "dps", "dpt",
+        ),
+        listOf("document", "spreadsheet", "presentation"), darkBackdrop = true,
+    ),
+    Pdf(setOf("pdf"), listOf("PDF"), darkBackdrop = true),
+    Image(setOf("jpg", "jpeg", "png", "bmp"), listOf("picture"), darkBackdrop = true),
+    Tiff(setOf("tif", "tiff"), listOf("picture"), darkBackdrop = true),
+    Table(setOf("csv"), listOf("CSV file")),
+    Text(setOf("txt"), listOf("text file")),
+    Web(setOf("html", "htm"), listOf("web page")),
+    WebArchive(setOf("mht", "mhtml"), listOf("saved web page")),
 }
 
-/** "a X, Y or Z", from each viewer's [Viewer.noun]. */
-val openableHint: String = Viewer.entries.map { it.noun }.distinct().let { "a " + it.dropLast(1).joinToString(", ") + " or " + it.last() }
+/** "a X, Y or Z", from each viewer's [Viewer.nouns]. */
+val openableHint: String = Viewer.entries.flatMap { it.nouns }.distinct().let { "a " + it.dropLast(1).joinToString(", ") + " or " + it.last() }
 
 fun categoryOf(ext: String): Category? = Category.entries.firstOrNull { ext in it.exts }
 

@@ -95,7 +95,8 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                 Viewer.Tiff -> Loaded(file, { loadTiff(file) }) { ImageViewer(it, file.name) }
                 Viewer.Web -> Loaded(file, { loadWebPage(file) }) { WebViewer(it) }
                 Viewer.WebArchive -> Loaded(file, { loadWebArchive(file) }) { WebViewer(it) }
-                Viewer.Pdf -> Loaded(file, { PdfDoc.open(this, file.uri) }, release = PdfDoc::closeLater) { PdfViewer(it) }
+                Viewer.Office -> Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) { PagedViewer(it) }
+                Viewer.Pdf -> Loaded<Pages>(file, { PdfDoc.open(this, file.uri) }, release = Pages::closeLater) { PagedViewer(it) }
                 null -> CantOpen(
                     file,
                     if (categoryOf(file.ext) != null) "Papercraft can't open .${file.ext} files yet. Support is coming in a later version."
