@@ -21,6 +21,8 @@ android {
     buildFeatures { compose = true }
     // One debug key for every machine and CI run, so a new debug APK installs over the old one.
     signingConfigs { getByName("debug") { storeFile = file("debug.keystore") } }
+    // Limit: release builds use the debug key, for speed tests only; a real upload key lifts it before any store release.
+    buildTypes { release { signingConfig = signingConfigs.getByName("debug") } }
 }
 
 /** Runs `cargo <cargoArgs>` in core/. Cargo tracks its own changes, so this always runs. */

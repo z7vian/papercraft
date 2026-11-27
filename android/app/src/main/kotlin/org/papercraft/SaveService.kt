@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContract
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.security.MessageDigest
 
 /** Why a save didn't happen. The working copy ([Drafts]) is kept, so the edit isn't lost. */
 sealed class SaveException(message: String, cause: Throwable? = null) : Exception(message, cause) {
@@ -102,8 +103,9 @@ class SaveService(private val context: Context) {
         // A full app storage must not stop the user from saving to the real file.
         runCatching { drafts.put(file, bytes) }
         val now = current(file.uri)
-        if (!overwrite && changedOnDisk(file.stamp, now)) throw SaveException.ChangedOnDisk(file.stamp, now)
+        if (!overwrite && changedOnDisk(file.stamp, now) && !stillOurs(file.uri)) throw SaveException.ChangedOnDisk(file.stamp, now)
         val after = write(file.uri, bytes)
+        written[file.uri] = sha256(bytes)
         drafts.discard(file.uri)
         return file.copy(size = after.size, modified = after.modified)
     }
@@ -117,8 +119,20 @@ class SaveService(private val context: Context) {
         if (from != null) runCatching { drafts.put(from, bytes) }
         context.keepAccess(target)
         write(target, bytes)
+        written[target] = sha256(bytes)
         if (from != null) drafts.discard(from.uri)
         return context.describe(target)
+    }
+
+    /**
+     * True when the file still holds exactly what this app last saved to it. On the emulator's Downloads
+     * provider the last-modified time read right after our own save later changed with nobody else
+     * touching the file, which looked like an outside change on the next save.
+     */
+    private fun stillOurs(uri: Uri): Boolean {
+        val mine = written[uri] ?: return false
+        return runCatching { context.contentResolver.openInputStream(uri)?.use { sha256(it.readBytes()) } }
+            .getOrNull()?.contentEquals(mine) == true
     }
 
     private fun current(uri: Uri): FileStamp = try {
@@ -162,5 +176,12 @@ class SaveService(private val context: Context) {
             resolver.openFileDescriptor(uri, "w")
         } ?: throw FileNotFoundException(uri.toString())
         return ParcelFileDescriptor.AutoCloseOutputStream(pfd)
+    }
+
+    private companion object {
+        /** SHA-256 of what this process last saved to each file, for [stillOurs]. */
+        val written = java.util.concurrent.ConcurrentHashMap<Uri, ByteArray>()
+
+        fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
     }
 }

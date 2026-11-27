@@ -34,3 +34,9 @@ jobs:
         with:
           name: papercraft-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
+      - run: sh gradlew assembleRelease # the speed of a real install: Compose runs much slower in debug builds
+        working-directory: android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: papercraft-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
