@@ -3,7 +3,7 @@
 
 mod convert;
 mod docx;
-mod pptx;
+pub(crate) mod pptx;
 mod xlsx;
 
 use std::sync::Arc;
@@ -32,6 +32,10 @@ trait Pages {
     fn render(&self, index: u32, scale: f32) -> Result<Option<Vec<u8>>, CoreError>;
     /// The page's text in reading order, for search; `None` past the last page.
     fn page_text(&self, index: u32) -> Result<Option<String>, CoreError>;
+    /// The page's speaker notes; `None` when it has none, past the last page, or for formats without notes.
+    fn notes(&self, _index: u32) -> Result<Option<String>, CoreError> {
+        Ok(None)
+    }
 }
 
 /// A Word, Excel or PowerPoint file, opened once and drawn one page at a time.
@@ -118,5 +122,10 @@ impl OfficeDoc {
     /// The page's text in reading order, for search; `None` past the last page.
     pub fn page_text(&self, index: u32) -> Result<Option<String>, CoreError> {
         self.ask(move |doc| doc.page_text(index))
+    }
+
+    /// The slide's speaker notes; `None` when it has none, past the last slide, or for documents and workbooks.
+    pub fn notes(&self, index: u32) -> Result<Option<String>, CoreError> {
+        self.ask(move |doc| doc.notes(index))
     }
 }
