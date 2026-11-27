@@ -174,6 +174,8 @@ impl PdfFile {
 
     /// Page `index` drawn `width` pixels wide on white (smaller if it would exceed 16 MP), or `None` past the last page.
     /// Pixels are RGBA and opaque, so already premultiplied: ready for `Bitmap.copyPixelsFromBuffer`.
+    // Limit: the pixels cross UniFFI as bytes, copied three more times (RustBuffer, Kotlin ByteArray, Bitmap), up to
+    // 64 MB each at the 16 MP cap; drawing straight into the Bitmap through one JNI call (plan.md doors 4-5) lifts it.
     pub fn render(&self, index: u32, width: u32) -> Result<Option<RgbaImage>, CoreError> {
         let Some(&size) = self.sizes.get(index as usize) else { return Ok(None) };
         let (w, h) = fit(size, width);
