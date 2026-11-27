@@ -240,6 +240,7 @@ private fun TypeTiles(counts: Map<Category?, Int>, selected: Category?, onSelect
 }
 
 private fun details(context: android.content.Context, file: DocFile) = listOfNotNull(
+    typeLabel(file.ext),
     if (System.currentTimeMillis() - file.openedAt < DateUtils.MINUTE_IN_MILLIS) "Just now"
     else DateUtils.getRelativeTimeSpanString(file.openedAt).toString(),
     file.size.takeIf { it >= 0 }?.let { Formatter.formatShortFileSize(context, it) },

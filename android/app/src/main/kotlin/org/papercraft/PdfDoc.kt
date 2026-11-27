@@ -14,7 +14,7 @@ import java.nio.ByteBuffer
 
 /** The PDF is locked: ask for its password and call [PdfDoc.open] again. [wrongPassword] is true when the one given didn't fit. */
 class PasswordProtectedException(val wrongPassword: Boolean) :
-    Exception(if (wrongPassword) "That password doesn't open this PDF." else "This PDF is password-protected. Password support is coming later.")
+    Exception(if (wrongPassword) "That password doesn't open this PDF." else "This PDF is password-protected.")
 
 /** A PDF drawn by PDFium in the Rust core, the same on every Android version. The core runs one PDFium call at a time. */
 class PdfDoc private constructor(private val file: PdfFile) : Pages {

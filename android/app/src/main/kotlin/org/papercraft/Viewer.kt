@@ -116,8 +116,10 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                 Viewer.Office -> Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
                     PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
                 }
-                Viewer.Pdf -> Loaded<Pages>(file, { PdfDoc.open(this, file.uri) }, release = Pages::closeLater) {
-                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
+                Viewer.Pdf -> PdfUnlock(file) { password, attempt, locked ->
+                    Loaded<Pages>(file, { PdfDoc.open(this, file.uri, password) }, release = Pages::closeLater, key = attempt, locked = locked) {
+                        PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
+                    }
                 }
                 else -> error("not a full-screen viewer")
             }
@@ -216,17 +218,23 @@ private fun openElsewhere(context: Context, uri: Uri) {
     runCatching { context.startActivity(chooser) }
 }
 
-/** [release] closes what [load] returned; loading finishes even if the user leaves, so nothing opened is lost. */
+/**
+ * [release] closes what [load] returned; loading finishes even if the user leaves, so nothing opened is lost.
+ * A new [key] loads again; [locked] shows instead of the error when the file needs a password.
+ */
 @Composable
-private fun <T : Any> Loaded(file: DocFile, load: Context.() -> T, release: (T) -> Unit = {}, content: @Composable (T) -> Unit) {
+private fun <T : Any> Loaded(
+    file: DocFile, load: Context.() -> T, release: (T) -> Unit = {}, key: Any? = null,
+    locked: (@Composable (PasswordProtectedException) -> Unit)? = null, content: @Composable (T) -> Unit,
+) {
     val context = LocalContext.current
-    val result by produceState<Result<T>?>(null, file.uri) {
+    val result by produceState<Result<T>?>(null, file.uri, key) {
         val loaded = withContext(NonCancellable + Dispatchers.IO) { runCatching { context.load() } }
         value = loaded
         awaitDispose { loaded.getOrNull()?.let(release) }
     }
     val r = result ?: return Spinner()
-    content(r.getOrElse { return CantOpen(file, friendlyError(it)) })
+    content(r.getOrElse { e -> return if (e is PasswordProtectedException && locked != null) locked(e) else CantOpen(file, friendlyError(e)) })
 }
 
 private fun friendlyError(t: Throwable): String = when (t) {
@@ -242,7 +250,7 @@ private fun Spinner() = Box(Modifier.fillMaxSize(), Alignment.Center) {
 }
 
 @Composable
-private fun CantOpen(file: DocFile, reason: String) {
+internal fun CantOpen(file: DocFile, reason: String) {
     val context = LocalContext.current
     Column(
         Modifier.fillMaxSize().padding(32.dp).semantics { liveRegion = LiveRegionMode.Polite },
