@@ -791,6 +791,9 @@ impl Words {
         })
         .map_err(|e| bad("document", e))?;
         self.pages = u32::try_from(self.engine.stats().retained_pages).map_err(|e| bad("document", e))?;
+        // The page text caches describe the old layout.
+        self.blocks = OnceCell::new();
+        self.skipped.get_mut().clear();
         Ok(())
     }
 }
