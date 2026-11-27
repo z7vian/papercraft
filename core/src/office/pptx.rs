@@ -48,13 +48,15 @@ impl Slides {
     }
 }
 
-/// One line per non-empty paragraph; a line break inside a paragraph is already a `\n` run.
+/// One line per paragraph with text; a line break inside a paragraph is already a `\n` run, and breaks or spaces
+/// ending a paragraph are dropped.
 fn push_body(body: &TextBody, out: &mut String) {
     for paragraph in &body.paragraphs {
         let start = out.len();
         for run in &paragraph.runs {
             out.push_str(&run.text);
         }
+        out.truncate(start + out[start..].trim_end().len());
         if out.len() > start {
             out.push('\n');
         }
@@ -130,9 +132,11 @@ mod tests {
         let doc = OfficeDoc::open(fixture("KEY02.pptx"), OfficeFamily::Presentation).unwrap();
         assert_eq!(doc.page_count(), Some(1));
         let text = doc.page_text(0).unwrap().unwrap();
-        let title = text.find("Welcome to Internet Explorer 9\nHTML5, Hardware Accelerated").expect(&text);
-        let speaker = text.find("Dean Hachamovitch\nGeneral Manager\nMicrosoft Corporation").expect(&text);
-        assert!(title < speaker, "{text}");
+        // The title's blank line is an authored second line break.
+        assert_eq!(
+            text,
+            "Welcome to Internet Explorer 9\n\nHTML5, Hardware Accelerated\nDean Hachamovitch\nGeneral Manager\nMicrosoft Corporation"
+        );
         assert_eq!(doc.page_text(1).unwrap(), None);
         // The notes page carries a footer and header but an empty notes body.
         assert_eq!(doc.notes(0).unwrap(), None);
