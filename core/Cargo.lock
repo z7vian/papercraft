@@ -1371,6 +1371,12 @@ name = "papercraft-core"
 version = "0.1.0"
 dependencies = [
  "betteroffice-docx",
+ "betteroffice-docx-edit",
+ "betteroffice-docx-layout",
+ "betteroffice-docx-parse",
+ "betteroffice-docx-raster",
+ "betteroffice-ooxml-text",
+ "betteroffice-opc",
  "betteroffice-pptx",
  "betteroffice-xlsx",
  "chardetng",
@@ -1379,6 +1385,7 @@ dependencies = [
  "image",
  "mail-parser",
  "office_oxide",
+ "serde_json",
  "uniffi",
 ]
 
