@@ -103,10 +103,13 @@ class SaveService(private val context: Context) {
         // A full app storage must not stop the user from saving to the real file.
         runCatching { drafts.put(file, bytes) }
         val now = current(file.uri)
-        if (!overwrite && changedOnDisk(file.stamp, now) && !stillOurs(file.uri)) throw SaveException.ChangedOnDisk(file.stamp, now)
+        val ours = if (!overwrite && changedOnDisk(file.stamp, now)) stillOurs(file.uri) else null
+        android.util.Log.i("PcSave", "save ${file.uri} opened=${file.stamp} now=$now ours=$ours known=${written.containsKey(file.uri)} keys=${written.keys}")
+        if (ours == false) throw SaveException.ChangedOnDisk(file.stamp, now)
         val after = write(file.uri, bytes)
         written[file.uri] = sha256(bytes)
         drafts.discard(file.uri)
+        android.util.Log.i("PcSave", "wrote ${bytes.size} after=$after")
         return file.copy(size = after.size, modified = after.modified)
     }
 
@@ -131,8 +134,9 @@ class SaveService(private val context: Context) {
      */
     private fun stillOurs(uri: Uri): Boolean {
         val mine = written[uri] ?: return false
-        return runCatching { context.contentResolver.openInputStream(uri)?.use { sha256(it.readBytes()) } }
-            .getOrNull()?.contentEquals(mine) == true
+        val read = runCatching { context.contentResolver.openInputStream(uri)?.use { it.readBytes() } }
+        android.util.Log.i("PcSave", "readback ${read.exceptionOrNull()} size=${read.getOrNull()?.size}")
+        return read.getOrNull()?.let { sha256(it) }?.contentEquals(mine) == true
     }
 
     private fun current(uri: Uri): FileStamp = try {
