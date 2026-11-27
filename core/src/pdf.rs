@@ -199,22 +199,20 @@ impl PdfFile {
         self.with_doc(move |doc| Ok(Some(Self::page(index, doc)?.text().map_err(bad)?.all())))
     }
 
-    /// Every case-insensitive match of `query`, in page order.
-    // Limit: searches the whole file in one call with no way to stop it; a per-page search lets the UI show hits as they come and cancel.
-    pub fn search(&self, query: String) -> Result<Vec<PdfHit>, CoreError> {
-        if query.trim().is_empty() {
+    /// Every case-insensitive match of `query` on page `index`, in reading order; empty past the last page.
+    /// One page per call, so a caller can stop between pages and renders can run in between.
+    pub fn search_page(&self, index: u32, query: String) -> Result<Vec<PdfHit>, CoreError> {
+        if query.trim().is_empty() || index as usize >= self.sizes.len() {
             return Ok(Vec::new());
         }
         self.with_doc(move |doc| {
-            let options = PdfSearchOptions::new();
+            let page = Self::page(index, doc)?;
+            let text = page.text().map_err(bad)?;
+            let search = text.search(&query, &PdfSearchOptions::new()).map_err(bad)?;
             let mut hits = Vec::new();
-            for (index, page) in doc.pages().iter().enumerate() {
-                let text = page.text().map_err(bad)?;
-                let search = text.search(&query, &options).map_err(bad)?;
-                while let Some(segments) = search.find_next() {
-                    let boxes = segments.iter().map(|s| drawn_box(&page, s.bounds())).collect::<Result<_, _>>()?;
-                    hits.push(PdfHit { page: index as u32, boxes });
-                }
+            while let Some(segments) = search.find_next() {
+                let boxes = segments.iter().map(|s| drawn_box(&page, s.bounds())).collect::<Result<_, _>>()?;
+                hits.push(PdfHit { page: index, boxes });
             }
             Ok(hits)
         })
@@ -270,10 +268,10 @@ mod tests {
     }
 
     #[test]
-    fn search_returns_boxes_on_the_page() {
+    fn search_page_returns_boxes_on_the_page() {
         let pdf = PdfFile::open(fixture("tracemonkey.pdf"), None).unwrap();
-        let hits = pdf.search("trace-based".into()).unwrap();
-        let first = hits.first().expect("a hit");
+        let hits = pdf.search_page(0, "TRACE-BASED".into()).unwrap();
+        let first = hits.first().expect("a case-insensitive hit");
         assert_eq!(first.page, 0);
         let size = pdf.page_size(0).unwrap();
         let b = first.boxes.first().expect("a box");
@@ -281,7 +279,8 @@ mod tests {
         assert!(0.0 <= b.top && b.top < b.bottom && b.bottom <= size.height, "{:?}", (b.top, b.bottom));
         // The title sits in the top third of the first page.
         assert!(b.bottom < size.height / 3.0);
-        assert!(pdf.search("  ".into()).unwrap().is_empty());
+        assert!(pdf.search_page(0, "  ".into()).unwrap().is_empty());
+        assert!(pdf.search_page(14, "trace".into()).unwrap().is_empty());
     }
 
     // issue6010_1.pdf: pdf.js test file (github.com/mozilla/pdf.js test/pdfs, Apache-2.0), user password "abc".

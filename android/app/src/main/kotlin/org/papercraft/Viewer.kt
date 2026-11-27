@@ -83,13 +83,14 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
     val viewer = viewerOf(file.ext)
     var status by remember { mutableStateOf<String?>(null) }
     var chrome by rememberSaveable { mutableStateOf(true) }
+    val find = remember { FindState() }
     val scope = rememberCoroutineScope()
     val saveThumb: (Bitmap) -> Unit = { bmp -> scope.launch(Dispatchers.IO) { runCatching { Thumbnails.save(context, file.uri, bmp) } } }
     BackHandler(onBack = onBack)
 
     if (viewer?.fullScreen == true) {
         // The bars float over the content, so hiding them never moves it.
-        SystemBarsVisible(chrome)
+        SystemBarsVisible(chrome || find.open)
         val hideOnScroll = remember {
             object : NestedScrollConnection {
                 override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
@@ -114,30 +115,34 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                     ImageViewer(it, file.name, toggle)
                 }
                 Viewer.Office -> Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
-                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
+                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb, find)
                 }
                 Viewer.Pdf -> Loaded<Pages>(file, { PdfDoc.open(this, file.uri) }, release = Pages::closeLater) {
-                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
+                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb, find)
                 }
                 else -> error("not a full-screen viewer")
             }
             AnimatedVisibility(
-                chrome,
+                chrome || find.open,
                 enter = slideInVertically(tween(220)) { -it } + fadeIn(tween(180)),
                 exit = slideOutVertically(tween(200)) { -it } + fadeOut(tween(150)),
             ) {
-                ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility)
+                if (find.open) FindBar(find, WindowInsets.statusBarsIgnoringVisibility)
+                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if (viewer == Viewer.Office || viewer == Viewer.Pdf) find::show else null)
             }
         }
     } else {
         val scroll = TopAppBarDefaults.enterAlwaysScrollBehavior()
         Scaffold(
             modifier = Modifier.nestedScroll(scroll.nestedScrollConnection).semantics { paneTitle = file.name },
-            topBar = { ViewerTopBar(file, status, onBack, scroll, TopAppBarDefaults.windowInsets) },
+            topBar = {
+                if (find.open) FindBar(find, TopAppBarDefaults.windowInsets)
+                else ViewerTopBar(file, status, onBack, scroll, TopAppBarDefaults.windowInsets, onFind = if (viewer == Viewer.Text) find::show else null)
+            },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).clipToBounds()) {
                 when (viewer) {
-                    Viewer.Text -> Loaded(file, { loadText(file) }) { TextViewer(it, monospace = file.ext == "prn") }
+                    Viewer.Text -> Loaded(file, { loadText(file) }) { TextViewer(it, find, monospace = file.ext == "prn") }
                     Viewer.Table -> Loaded(file, { loadTable(file) }) { TableViewer(it) }
                     Viewer.Web -> Loaded(file, { loadWebPage(file) }) { WebViewer(it) }
                     Viewer.WebArchive -> Loaded(file, { loadWebArchive(file) }) { WebViewer(it) }
@@ -167,7 +172,7 @@ private fun SystemBarsVisible(visible: Boolean) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets) {
+private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets, onFind: (() -> Unit)?) {
     val context = LocalContext.current
     var menu by remember { mutableStateOf(false) }
     TopAppBar(
@@ -182,6 +187,7 @@ private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scr
         },
         navigationIcon = { IconButton(onBack) { Icon(painterResource(R.drawable.ic_back), "Back") } },
         actions = {
+            onFind?.let { IconButton(it) { Icon(painterResource(R.drawable.ic_search), "Find in file") } }
             IconButton({ share(context, file.uri) }) { Icon(painterResource(R.drawable.ic_share), "Share") }
             Box {
                 IconButton({ menu = true }) { Icon(painterResource(R.drawable.ic_more), "More options") }
