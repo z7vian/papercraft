@@ -98,6 +98,7 @@ typealias EditorScreen = @Composable (file: DocFile, restore: Boolean, onClose: 
 /** Every editor and the office family it edits. Word and Excel plug in with one line each here. */
 enum class Editor(val family: Category, val screen: EditorScreen) {
     Slides(Category.Slides, { file, restore, onClose -> SlideEditScreen(file, restore, onClose) }),
+    Words(Category.Docs, { file, restore, onClose -> WordEditScreen(file, restore, onClose) }),
 }
 
 /** The editor for files with extension [ext], or null when Papercraft can't edit them: only files the office engine opens are editable. */
