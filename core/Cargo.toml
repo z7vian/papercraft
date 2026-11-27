@@ -36,6 +36,11 @@ serde_json = "1"
 betteroffice-pptx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
 betteroffice-xlsx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
 office_oxide = "0.1.17"
+# The spreadsheet grid reads cells straight from the engine's parser (`sheet.rs`).
+betteroffice-opc = "0.6.0"
+betteroffice-xlsx-model = "0.6.0"
+betteroffice-xlsx-parse = "0.6.0"
+quick-xml = "0.41"
 
 [profile.release]
 lto = true
