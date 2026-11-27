@@ -1371,14 +1371,18 @@ name = "papercraft-core"
 version = "0.1.0"
 dependencies = [
  "betteroffice-docx",
+ "betteroffice-opc",
  "betteroffice-pptx",
  "betteroffice-xlsx",
+ "betteroffice-xlsx-model",
+ "betteroffice-xlsx-parse",
  "chardetng",
  "csv",
  "encoding_rs",
  "image",
  "mail-parser",
  "office_oxide",
+ "quick-xml 0.41.0",
  "uniffi",
 ]
 
