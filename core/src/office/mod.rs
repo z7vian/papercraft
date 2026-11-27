@@ -1,7 +1,7 @@
 //! Word, Excel and PowerPoint files for viewing. One file per format family owns its engine:
 //! `docx.rs`, `pptx.rs`, `xlsx.rs`; `convert.rs` turns the old binary formats into OOXML first.
 
-mod convert;
+pub(crate) mod convert;
 mod docx;
 mod pptx;
 mod xlsx;

@@ -1373,6 +1373,7 @@ dependencies = [
  "betteroffice-docx",
  "betteroffice-pptx",
  "betteroffice-xlsx",
+ "betteroffice-xlsx-render",
  "chardetng",
  "csv",
  "encoding_rs",
@@ -1380,6 +1381,7 @@ dependencies = [
  "mail-parser",
  "office_oxide",
  "uniffi",
+ "zip",
 ]
 
 [[package]]

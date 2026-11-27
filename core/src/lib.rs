@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 mod mhtml;
 mod office;
 mod table;
+mod sheet_edit;
 mod text;
 mod tiff;
 
