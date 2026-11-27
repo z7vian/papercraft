@@ -22,7 +22,7 @@ use crate::CoreError;
 /// Space between pages in the layout's page coordinates, as the engine's own renderer asks for.
 const PAGE_GAP: f64 = 24.0;
 
-pub(super) struct Words {
+pub(crate) struct Words {
     engine: EngineSession,
     pages: u32,
     /// Font ids the layout measured with, by chain key; drawing a page shapes its text with them.
@@ -745,6 +745,54 @@ fn chosen_branch<'a>(alternate: &'a str, prefix: &str) -> Option<&'a str> {
         }
         Some(&alternate[tag_end + 1..end - name.len() - "</>".len()])
     })
+}
+
+/// What the Word editor (`doc_edit.rs`) uses: the retained layout opened once, edits mirrored into its session,
+/// and a relayout that measures again only the blocks those edits changed.
+impl Words {
+    pub(crate) fn open_retained(bytes: &[u8]) -> Result<Self, CoreError> {
+        Self::open(bytes)
+    }
+
+    pub(crate) fn engine(&self) -> &EngineSession {
+        &self.engine
+    }
+
+    pub(crate) fn page_total(&self) -> u32 {
+        self.pages
+    }
+
+    /// PNG of page `index` at `scale`, or `None` past the last page.
+    pub(crate) fn render_page(&self, index: u32, scale: f32) -> Result<Option<Vec<u8>>, CoreError> {
+        Ok(self.draw(index, scale)?.map(|page| page.bytes))
+    }
+
+    /// The package fields the layout request reads, as JSON.
+    pub(crate) fn layout_package_json(package: &docx_parse::S9PackageWire) -> Result<Value, CoreError> {
+        layout_package(package).map_err(|e| bad("document", e))
+    }
+
+    /// Lays the session out again after edits made through [`Self::engine`]. The engine reuses the measurement of
+    /// every block whose content and width did not change; faces a new font needs load first.
+    pub(crate) fn relayout(&mut self, package: &Value) -> Result<(), CoreError> {
+        let mut request = docx_edit::layout_request::region_layout_request(package, PAGE_GAP);
+        request["measurement"] = docx_edit::layout_request::measurement(package);
+        let requirements =
+            self.engine.layout_font_requirements_json(&request.to_string()).map_err(|e| bad("document", e))?;
+        let requirements = font_requirements(&requirements)?;
+        let fonts = self.fonts.get_mut();
+        fonts.resolve(&requirements)?;
+        self.layout_chains = fonts.layout_chains(&requirements);
+        request["measurement"]["fontChains"] = json!(self.layout_chains);
+        let request = request.to_string();
+        let engine = &self.engine;
+        docx_layout::with_measure_font_store(&mut fonts.store, || {
+            engine.layout_document_with_regions_after_edit(&request, None)
+        })
+        .map_err(|e| bad("document", e))?;
+        self.pages = u32::try_from(self.engine.stats().retained_pages).map_err(|e| bad("document", e))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
