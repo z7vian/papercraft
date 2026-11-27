@@ -577,7 +577,8 @@ impl Ref {
     /// `RgceLoc`/`RgceLocRel`: the column word carries the relative flags. With `offsets`, relative parts
     /// count from the origin and wrap around the 65536 x 256 BIFF8 grid.
     fn loc(at: Origin, rw: u16, col: u16, offsets: bool) -> Self {
-        let (row_rel, col_rel) = (col & 0x4000 != 0, col & 0x8000 != 0);
+        // fColRelative is bit 14, fRwRelative bit 15.
+        let (col_rel, row_rel) = (col & 0x4000 != 0, col & 0x8000 != 0);
         let row = if offsets && row_rel { at.row.wrapping_add(rw) } else { rw };
         let col = if offsets && col_rel { u16::from((at.col as u8).wrapping_add(col as u8)) } else { col & 0x3FFF };
         Ref { row: row.into(), col: col.into(), row_abs: !row_rel, col_abs: !col_rel }
