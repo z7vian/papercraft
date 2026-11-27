@@ -19,6 +19,8 @@ android {
         versionName = "0.1.0"
     }
     buildFeatures { compose = true }
+    // One debug key for every machine and CI run, so a new debug APK installs over the old one.
+    signingConfigs { getByName("debug") { storeFile = file("debug.keystore") } }
 }
 
 /** Runs `cargo <cargoArgs>` in core/. Cargo tracks its own changes, so this always runs. */
@@ -52,6 +54,10 @@ val buildRust = tasks.register<Cargo>("buildRust") {
         "ndk", "-t", "arm64-v8a", "-t", "x86_64", "--platform", "26",
         "-o", rustLibs.get().asFile.path, "build", "--release",
     ))
+    // cargo-ndk copies every .so the build makes (some engine crates are cdylibs too); the app loads only ours.
+    doLast {
+        rustLibs.get().asFile.walk().filter { it.isFile && it.name != "libpapercraft_core.so" }.forEach { it.delete() }
+    }
 }
 
 val rustKotlinBindings = tasks.register<Cargo>("rustKotlinBindings") {
