@@ -62,7 +62,7 @@ fun Context.loadTiff(file: DocFile): ImageBitmap {
 }
 
 @Composable
-fun ImageViewer(image: ImageBitmap, name: String) {
+fun ImageViewer(image: ImageBitmap, name: String, onTap: () -> Unit) {
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var box by remember { mutableStateOf(IntSize.Zero) }
@@ -81,7 +81,7 @@ fun ImageViewer(image: ImageBitmap, name: String) {
         Modifier.fillMaxSize()
             .onSizeChanged { box = it }
             .semantics { onClick(label = if (scale > 1f) "Zoom out" else "Zoom in") { toggle(); true } }
-            .pointerInput(Unit) { detectTapGestures(onDoubleTap = { toggle() }) }
+            .pointerInput(Unit) { detectTapGestures(onTap = { onTap() }, onDoubleTap = { toggle() }) }
             .transformable(zoom)
             .graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y },
         contentScale = ContentScale.Fit,

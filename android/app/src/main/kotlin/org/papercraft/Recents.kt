@@ -19,6 +19,7 @@ class Recents(private val context: Context) {
         val keptUris = kept.mapTo(HashSet()) { it.uri }
         load().filter { it.uri !in keptUris }.forEach {
             runCatching { context.contentResolver.releasePersistableUriPermission(it.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            Thumbnails.delete(context, it.uri)
         }
         prefs.edit().putString("files", kept.joinToString("\n") { it.encode() }).apply()
         return kept

@@ -33,20 +33,21 @@ enum class Category(val label: String, val color: Color, val exts: Set<String>) 
 
 /**
  * How a file is shown. [nouns] name what it opens, for the home screen hint (listed in this order).
+ * [fullScreen] viewers fill the screen under floating bars that hide for reading; the others sit under a top bar.
  * The "open with" intent filter in AndroidManifest.xml lists the MIME types of these extensions.
  */
-enum class Viewer(val exts: Set<String>, val nouns: List<String>, val darkBackdrop: Boolean = false) {
+enum class Viewer(val exts: Set<String>, val nouns: List<String>, val fullScreen: Boolean = false) {
     Office(
         setOf(
             "docx", "docm", "dotx", "dotm", "doc", "dot", "wps", "wpt",
             "xlsx", "xlsm", "xltx", "xltm", "xlam", "xls", "xlt", "xla", "et", "ett",
             "pptx", "pptm", "potx", "potm", "ppsx", "ppsm", "ppt", "pot", "pps", "dps", "dpt",
         ),
-        listOf("document", "spreadsheet", "presentation"), darkBackdrop = true,
+        listOf("document", "spreadsheet", "presentation"), fullScreen = true,
     ),
-    Pdf(setOf("pdf"), listOf("PDF"), darkBackdrop = true),
-    Image(setOf("jpg", "jpeg", "png", "bmp"), listOf("picture"), darkBackdrop = true),
-    Tiff(setOf("tif", "tiff"), listOf("picture"), darkBackdrop = true),
+    Pdf(setOf("pdf"), listOf("PDF"), fullScreen = true),
+    Image(setOf("jpg", "jpeg", "png", "bmp"), listOf("picture"), fullScreen = true),
+    Tiff(setOf("tif", "tiff"), listOf("picture"), fullScreen = true),
     Table(setOf("csv"), listOf("CSV file")),
     Text(setOf("txt"), listOf("text file")),
     Web(setOf("html", "htm"), listOf("web page")),
@@ -62,9 +63,9 @@ fun viewerOf(ext: String): Viewer? = Viewer.entries.firstOrNull { ext in it.exts
 
 /** Colored tile with the extension, like WPS/Office file icons. Decorative: the row text already says the type. */
 @Composable
-fun FileBadge(ext: String, size: Dp = 44.dp) {
+fun FileBadge(ext: String, size: Dp = 44.dp, modifier: Modifier = Modifier) {
     Box(
-        Modifier.size(size).clip(RoundedCornerShape(size * 0.23f))
+        modifier.size(size).clip(RoundedCornerShape(size * 0.23f))
             .background(categoryOf(ext)?.color ?: Color(0xFF6B6B6B))
             .clearAndSetSemantics {},
         contentAlignment = Alignment.Center,

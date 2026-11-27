@@ -7,12 +7,15 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.SystemBarStyle
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -21,6 +24,7 @@ import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,12 +44,24 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         // A file handed to us by another app ("Open with"); only on first launch, not after recreation.
         val launchUri = intent?.data.takeIf { savedInstanceState == null }
-        setContent { PapercraftTheme { App(launchUri) } }
+        val settings = Settings(this)
+        setContent {
+            var mode by remember { mutableStateOf(settings.theme) }
+            val dark = mode.isDark(isSystemInDarkTheme())
+            // Status and navigation bar icons follow the app's theme, not the system's, when the two differ.
+            DisposableEffect(dark) {
+                val transparent = android.graphics.Color.TRANSPARENT
+                val style = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
+                enableEdgeToEdge(style, style)
+                onDispose {}
+            }
+            PapercraftTheme(mode) { App(launchUri, mode) { mode = it; settings.theme = it } }
+        }
     }
 }
 
 @Composable
-fun App(launchUri: Uri?) {
+fun App(launchUri: Uri?, themeMode: ThemeMode, onThemeChange: (ThemeMode) -> Unit) {
     val context = LocalContext.current
     val activity = LocalActivity.current
     val store = remember { Recents(context) }
@@ -96,14 +112,16 @@ fun App(launchUri: Uri?) {
         targetState = file,
         contentKey = { it?.uri },
         transitionSpec = {
-            if (targetState != null) (slideInHorizontally { it / 5 } + fadeIn()) togetherWith fadeOut()
-            else fadeIn() togetherWith (slideOutHorizontally { it / 5 } + fadeOut())
+            if (targetState != null) (scaleIn(tween(260), initialScale = 0.96f) + fadeIn(tween(200))) togetherWith fadeOut(tween(120))
+            else fadeIn(tween(200)) togetherWith (scaleOut(tween(220), targetScale = 0.96f) + fadeOut(tween(160)))
         },
         label = "screen",
     ) { current ->
         if (current == null) HomeScreen(
             recents = recents,
             snackbar = snackbar,
+            themeMode = themeMode,
+            onThemeChange = onThemeChange,
             onPick = { scope.launch { openUri(it) } },
             onOpen = { openRecent(it) },
             onRemove = { recents = store.remove(it) },
