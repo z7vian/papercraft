@@ -113,7 +113,9 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                     LaunchedEffect(it) { saveThumb(it.asAndroidBitmap()) }
                     ImageViewer(it, file.name, toggle)
                 }
-                Viewer.Office -> Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
+                Viewer.Office -> if (categoryOf(file.ext) == Category.Sheets) {
+                    Loaded(file, { SheetGridBook.open(this, file) }, release = SheetGridBook::close) { SheetGrid(it, barSpace, chrome, toggle, saveThumb) }
+                } else Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
                     PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
                 }
                 Viewer.Pdf -> Loaded<Pages>(file, { PdfDoc.open(this, file.uri) }, release = Pages::closeLater) {
