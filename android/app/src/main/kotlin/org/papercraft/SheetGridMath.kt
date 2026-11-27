@@ -179,8 +179,8 @@ fun sheetColumnName(index: Int): String {
 }
 
 /** Excel's last row and column, 1-based. */
-private const val SHEET_ROWS = 1_048_576
-private const val SHEET_COLS = 16_384
+internal const val SHEET_ROWS = 1_048_576
+internal const val SHEET_COLS = 16_384
 
 /** Where tapping a link goes. */
 sealed interface GridLinkTarget {

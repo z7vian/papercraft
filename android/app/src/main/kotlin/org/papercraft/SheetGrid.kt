@@ -101,7 +101,7 @@ private const val GRID_MIN_ZOOM = 0.5f
 private const val GRID_MAX_ZOOM = 4f
 
 /** Excel's default gridline grey: part of how the sheet looks, like the white paper. */
-private const val EXCEL_GRIDLINE = 0xFFD4D4D4.toInt()
+internal const val EXCEL_GRIDLINE = 0xFFD4D4D4.toInt()
 
 /** Where a pane was scrolled, in sheet pixels past its frozen tracks. */
 private class GridScroll(val x: Double, val y: Double)
@@ -463,7 +463,7 @@ private fun GridPane(
 }
 
 /** Blocks the screen shows, those just beside it whose text may run in, and the anchors of merges in view. */
-private fun neededBlocks(v: GridViewport, grid: GridSheet): Set<GridBlockKey> {
+internal fun neededBlocks(v: GridViewport, grid: GridSheet): Set<GridBlockKey> {
     val frozenRows = 0 until v.frozenRows
     val frozenCols = 0 until v.frozenCols
     val bodyCols = max(v.frozenCols, v.bodyCols.first - GRID_SPILL_COLS)..v.bodyCols.last + GRID_SPILL_COLS

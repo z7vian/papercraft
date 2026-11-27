@@ -55,6 +55,10 @@ class SheetGridBook private constructor(private val doc: SheetDoc) {
         fun open(context: Context, file: DocFile) = SheetGridBook(
             SheetDoc.open(context.readBytes(file), OfficeFamily.SPREADSHEET, java.util.Locale.getDefault().toLanguageTag()),
         )
+
+        /** Blocking: reads a workbook held in memory, such as the editor's latest save. */
+        fun open(bytes: ByteArray) =
+            SheetGridBook(SheetDoc.open(bytes, OfficeFamily.SPREADSHEET, java.util.Locale.getDefault().toLanguageTag()))
     }
 }
 
@@ -185,6 +189,9 @@ internal class GridBlock(val cells: List<GridCellDraw>, private val key: GridBlo
     }
 
     fun at(row: Int, col: Int): GridCellDraw? = byPos[(row - key.firstRow) * GRID_BLOCK_COLS + (col - key.firstCol)]
+
+    /** This block with [cell] in place of what it held there. */
+    fun with(cell: GridCellDraw) = GridBlock(cells.filterNot { it.row == cell.row && it.col == cell.col } + cell, key)
 }
 
 /** Blocks kept per sheet: enough for a tablet screen at the smallest zoom plus the way back. */
@@ -207,6 +214,14 @@ internal class GridCells(private val book: SheetGridBook, private val sheet: Gri
     fun cell(row: Int, col: Int): GridCellDraw? = blocks[GridBlockKey(row / GRID_BLOCK_ROWS, col / GRID_BLOCK_COLS)]?.at(row, col)
 
     fun loaded(keys: Collection<GridBlockKey>) = keys.all { it in blocks }
+
+    /** Shows [cell] instead of what its block loaded, when that block is loaded: an edit shows before the workbook reloads. */
+    fun put(cell: SheetCell) {
+        val key = GridBlockKey(cell.row.toInt() / GRID_BLOCK_ROWS, cell.col.toInt() / GRID_BLOCK_COLS)
+        val block = blocks[key] ?: return
+        blocks[key] = block.with(GridCellDraw.of(cell, sheet, fonts))
+        version++
+    }
 
     /** Loads the blocks not cached yet, one at a time off the main thread. A block that fails stays empty. */
     suspend fun load(keys: Collection<GridBlockKey>) {
