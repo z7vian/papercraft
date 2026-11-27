@@ -878,7 +878,8 @@ mod tests {
         on_engine_stack(|| {
             let doc = open("wordtext/footnotes.docx");
             let (text, body) = page_text_around_body(&doc, 0);
-            assert!(body.contains("Eto ochen prostoy text so snoskoy"), "{body}");
+            // The engine's body text keeps the footnote's reference mark.
+            assert!(body.contains("Eto ochen prostoy1 text so snoskoy"), "{body}");
             assert!(!body.contains("snoska"), "{body}");
             assert!(at(&text, &body) < at(&text, "snoska"), "{text}");
         });
