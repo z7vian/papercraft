@@ -30,8 +30,17 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.papercraft.core.parseCsv
+import org.papercraft.core.parseDbf
+import org.papercraft.core.parseDif
 
-fun Context.loadTable(file: DocFile): List<List<String>> = parseCsv(readBytes(file, MAX_TEXT_BYTES))
+fun Context.loadTable(file: DocFile): List<List<String>> {
+    val bytes = readBytes(file, MAX_TEXT_BYTES)
+    return when (file.ext) {
+        "dbf" -> parseDbf(bytes)
+        "dif" -> parseDif(bytes)
+        else -> parseCsv(bytes)
+    }
+}
 
 @Composable
 fun TableViewer(rows: List<List<String>>) {

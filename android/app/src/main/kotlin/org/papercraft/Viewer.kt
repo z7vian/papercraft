@@ -137,7 +137,7 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).clipToBounds()) {
                 when (viewer) {
-                    Viewer.Text -> Loaded(file, { loadText(file) }) { TextViewer(it) }
+                    Viewer.Text -> Loaded(file, { loadText(file) }) { TextViewer(it, monospace = file.ext == "prn") }
                     Viewer.Table -> Loaded(file, { loadTable(file) }) { TableViewer(it) }
                     Viewer.Web -> Loaded(file, { loadWebPage(file) }) { WebViewer(it) }
                     Viewer.WebArchive -> Loaded(file, { loadWebArchive(file) }) { WebViewer(it) }

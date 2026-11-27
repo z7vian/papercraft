@@ -48,8 +48,8 @@ enum class Viewer(val exts: Set<String>, val nouns: List<String>, val fullScreen
     Pdf(setOf("pdf"), listOf("PDF"), fullScreen = true),
     Image(setOf("jpg", "jpeg", "png", "bmp"), listOf("picture"), fullScreen = true),
     Tiff(setOf("tif", "tiff"), listOf("picture"), fullScreen = true),
-    Table(setOf("csv"), listOf("CSV file")),
-    Text(setOf("txt"), listOf("text file")),
+    Table(setOf("csv", "dbf", "dif"), listOf("CSV file")),
+    Text(setOf("txt", "rtf", "xml", "prn"), listOf("text file")),
     Web(setOf("html", "htm"), listOf("web page")),
     WebArchive(setOf("mht", "mhtml"), listOf("saved web page")),
 }

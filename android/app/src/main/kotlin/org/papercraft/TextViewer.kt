@@ -10,21 +10,36 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import org.papercraft.core.decodeText
+import org.papercraft.core.formatXml
+import org.papercraft.core.parsePrn
+import org.papercraft.core.parseRtf
 
 // Limit: text/CSV become ~5x their size in memory; stream them to lift this.
 internal const val MAX_TEXT_BYTES = 30_000_000L
 
-// Giant lines (minified JSON, logs) are split so no single Text has to lay out megabytes.
-fun Context.loadText(file: DocFile): List<String> =
-    decodeText(readBytes(file, MAX_TEXT_BYTES)).lines().flatMap { it.chunked(4000).ifEmpty { listOf("") } }
+/** Lines to show for a .txt, .rtf (paragraphs), .xml (indented when well-formed) or .prn (printed layout) file. */
+fun Context.loadText(file: DocFile): List<String> {
+    val bytes = readBytes(file, MAX_TEXT_BYTES)
+    val lines = when (file.ext) {
+        "rtf" -> parseRtf(bytes)
+        "xml" -> formatXml(bytes)
+        "prn" -> parsePrn(bytes)
+        else -> decodeText(bytes).lines()
+    }
+    // Giant lines (minified JSON, logs) are split so no single Text has to lay out megabytes.
+    return lines.flatMap { it.chunked(4000).ifEmpty { listOf("") } }
+}
 
+/** [monospace] keeps space-aligned columns (print files) lined up. */
 @Composable
-fun TextViewer(lines: List<String>) {
+fun TextViewer(lines: List<String>, monospace: Boolean = false) {
+    val style = MaterialTheme.typography.bodyLarge.let { if (monospace) it.copy(fontFamily = FontFamily.Monospace) else it }
     SelectionContainer {
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp)) {
-            items(lines) { Text(it, style = MaterialTheme.typography.bodyLarge) }
+            items(lines) { Text(it, style = style) }
         }
     }
 }
