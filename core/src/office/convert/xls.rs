@@ -1,6 +1,7 @@
-//! Excel 97-2003 (BIFF8) workbooks as SpreadsheetML. office_oxide reads the cell values, comments, links
-//! and names; this module reads the formatting records its model drops (fonts, number formats, cell
-//! formats, column widths, row heights, merged cells, panes, pictures) and writes the package itself.
+//! Excel 97-2003 (BIFF8) workbooks as SpreadsheetML. office_oxide reads the cell values, comments and links;
+//! this module reads what its model drops (fonts, number formats, cell formats and their Excel 2007
+//! colours, column widths, row heights, merged cells, panes, pictures, formulas, names, conditional
+//! formats, data validations) and writes the package itself.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -8,7 +9,7 @@ use std::io::Cursor;
 
 use office_oxide::DocumentFormat;
 use office_oxide::cfb::CfbReader;
-use office_oxide::core::opc::{OpcWriter, PartName};
+use office_oxide::core::opc::{OpcReader, OpcWriter, PartName};
 use office_oxide::core::relationships::{TargetMode, rel_types};
 use office_oxide::xls::{CellValue, Sheet, XlsDocument};
 
@@ -27,8 +28,7 @@ pub(super) fn to_xlsx(bytes: Vec<u8>) -> Result<Vec<u8>, CoreError> {
     if book.sheets.len() != layout.sheets.len() {
         return via_model(bytes, DocumentFormat::Xls);
     }
-    // Limit: formulas arrive as their last computed values (office_oxide keeps no formula text), so an edit does not recalculate them; decoding BIFF formula tokens lifts it.
-    // Limit: embedded charts, conditional formats and data validations are not written; DrawingML chart and SpreadsheetML rule writers lift it.
+    // Limit: embedded charts are not written; a DrawingML chart writer lifts it.
     write(&book, &layout).map_err(|e| bad("file", e))
 }
 
@@ -54,6 +54,9 @@ const WINDOW2: u16 = 0x023E;
 const PANE: u16 = 0x0041;
 const MULRK: u16 = 0x00BD;
 const MULBLANK: u16 = 0x00BE;
+const XFEXT: u16 = 0x087D;
+const THEME: u16 = 0x0896;
+const CONTINUEFRT12: u16 = 0x087F;
 /// Records that hold one cell and start with `rw`, `col`, `ixfe`.
 const ONE_CELL: [u16; 8] = [0x0006, 0x0201, 0x0203, 0x0204, 0x0205, 0x00FD, 0x027E, 0x00D6];
 
@@ -72,6 +75,11 @@ const DEFAULT_PALETTE: [u32; 56] = [
     0xFF9900, 0xFF6600, 0x666699, 0x969696, 0x003366, 0x339966, 0x003300, 0x333300, 0x993300, 0x993366, 0x333399,
     0x333333,
 ];
+
+/// The Office 2007 theme colours, what `THEME` version 124226 names, in SpreadsheetML theme index order:
+/// lt1, dk1, lt2, dk2, accent1-6, hyperlink, followed hyperlink.
+const OFFICE_THEME: [u32; 12] =
+    [0xFFFFFF, 0x000000, 0xEEECE1, 0x1F497D, 0x4F81BD, 0xC0504D, 0x9BBB59, 0x8064A2, 0x4BACC6, 0xF79646, 0x0000FF, 0x800080];
 /// Indices 0-7 never change.
 const FIXED_COLORS: [u32; 8] = [0x000000, 0xFFFFFF, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF];
 
@@ -128,10 +136,37 @@ struct Layout {
     fonts: Vec<Font>,
     formats: Vec<(u16, String)>,
     xfs: Vec<[u8; 20]>,
+    /// `XFEXT` colours by XF index: the extension type (4 fill foreground, 5 fill background, 7-11 top,
+    /// bottom, left, right and diagonal border, 13 text) and the colour.
+    xf_colors: HashMap<u16, Vec<(u16, ExtColor)>>,
     palette: Vec<u32>,
+    /// The workbook theme's colours in SpreadsheetML theme index order.
+    theme: [u32; 12],
+    /// The theme package `THEME` and its `CONTINUEFRT12` records carry, while they are read.
+    theme_package: Option<Vec<u8>>,
+    /// Whether the last record was `THEME` or one of its continuations.
+    theme_open: bool,
     date1904: bool,
     pictures: Vec<Option<Picture>>,
+    links: formula::Links,
     sheets: Vec<SheetLayout>,
+}
+
+/// An Excel 2007 colour (`FullColorExt`): automatic, palette index, RGB or theme colour, and its tint.
+#[derive(Clone, Copy)]
+struct ExtColor {
+    kind: u16,
+    tint: f64,
+    value: u32,
+}
+
+/// A colour as SpreadsheetML writes it.
+#[derive(Clone, Copy)]
+enum Paint {
+    Rgb(u32),
+    /// The system window text (64) and window background (65) colours.
+    System(u16),
+    Auto,
 }
 
 struct Font {
@@ -165,6 +200,8 @@ struct SheetLayout {
     window: Option<u16>,
     pane: Option<(u16, u16)>,
     drawing: Vec<u8>,
+    formulas: formula::SheetFormulas,
+    rules: rules::SheetRules,
 }
 
 enum State {
@@ -185,7 +222,7 @@ impl Layout {
 
     /// `None` when the stream is not a readable BIFF8 workbook.
     fn parse(stream: &[u8]) -> Option<Self> {
-        let mut layout = Layout { palette: DEFAULT_PALETTE.to_vec(), ..Default::default() };
+        let mut layout = Layout { palette: DEFAULT_PALETTE.to_vec(), theme: OFFICE_THEME, ..Default::default() };
         let mut group = Vec::new();
         let mut state = State::Start;
         let mut last = 0u16;
@@ -236,10 +273,16 @@ impl Layout {
             };
         }
         layout.pictures = art::picture_store(&group, &[]);
+        layout.links.finish();
+        if let Some(package) = layout.theme_package.take() {
+            layout.theme = theme_colors(package).unwrap_or(OFFICE_THEME);
+        }
         Some(layout)
     }
 
     fn globals_record(&mut self, kind: u16, kind_of_data: u16, data: &[u8], group: &mut Vec<u8>) {
+        self.links.record(kind_of_data, kind == CONTINUE, data);
+        let theme_open = std::mem::replace(&mut self.theme_open, matches!(kind_of_data, THEME | CONTINUEFRT12));
         match kind_of_data {
             FONT if kind == FONT => {
                 if let Some(font) = parse_font(data) {
@@ -264,6 +307,16 @@ impl Layout {
                 }
             },
             DATEMODE if kind == DATEMODE => self.date1904 = u16_at(data, 0).is_some_and(|v| v != 0),
+            XFEXT if kind == XFEXT => self.xf_ext(data),
+            // A theme other than the built-in Office one comes as a zipped theme package.
+            THEME if kind == THEME => {
+                self.theme_package = (u32_at(data, 12) != Some(124_226)).then(|| data.get(16..).unwrap_or_default().to_vec());
+            },
+            CONTINUEFRT12 if theme_open => {
+                if let Some(package) = self.theme_package.as_mut() {
+                    package.extend_from_slice(data.get(12..).unwrap_or_default());
+                }
+            },
             MSODRAWINGGROUP => group.extend_from_slice(data),
             _ => {},
         }
@@ -277,6 +330,128 @@ impl Layout {
             _ => None,
         }
     }
+
+    /// Colour index `icv` as SpreadsheetML writes it.
+    fn paint(&self, icv: u16) -> Paint {
+        match self.rgb(icv) {
+            Some(rgb) => Paint::Rgb(rgb),
+            None if icv == 64 || icv == 65 => Paint::System(icv),
+            None => Paint::Auto,
+        }
+    }
+
+    /// `XFEXT` ([MS-XLS] §2.4.355): frtHeader, reserved, ixfe, reserved, count, then `ExtProp`s (type, size
+    /// including its own 4 bytes, data).
+    fn xf_ext(&mut self, data: &[u8]) {
+        let (Some(xf), Some(count)) = (u16_at(data, 14), u16_at(data, 18)) else { return };
+        let mut at = 20;
+        let mut colors = Vec::new();
+        for _ in 0..count {
+            let (Some(kind), Some(size)) = (u16_at(data, at), u16_at(data, at + 2)) else { break };
+            let size = usize::from(size);
+            if size < 4 {
+                break;
+            }
+            if matches!(kind, 4 | 5 | 7..=11 | 13)
+                && let (Some(color), Some(tint), Some(value)) = (u16_at(data, at + 4), u16_at(data, at + 6), u32_at(data, at + 8))
+            {
+                colors.push((kind, ExtColor { kind: color, tint: f64::from(tint as i16) / 32767.0, value }));
+            }
+            at += size;
+        }
+        if !colors.is_empty() {
+            self.xf_colors.insert(xf, colors);
+        }
+    }
+
+    /// An `XFEXT` colour; `None` when it is left unset.
+    fn ext_paint(&self, c: ExtColor) -> Option<Paint> {
+        let rgb = match c.kind {
+            0 => return Some(Paint::Auto),
+            1 => match self.paint(c.value as u16) {
+                Paint::Rgb(rgb) => rgb,
+                other => return Some(other),
+            },
+            // LongRGBA: red, green, blue, alpha bytes.
+            2 => (c.value & 0xFF) << 16 | c.value & 0xFF00 | (c.value >> 16) & 0xFF,
+            3 => *self.theme.get(c.value as usize)?,
+            _ => return None,
+        };
+        Some(Paint::Rgb(tinted(rgb, c.tint)))
+    }
+
+    /// XF `xf`'s `XFEXT` colour of extension type `kind`.
+    fn xf_paint(&self, xf: usize, kind: u16) -> Option<Paint> {
+        let colors = self.xf_colors.get(&u16::try_from(xf).ok()?)?;
+        colors.iter().find(|c| c.0 == kind).and_then(|c| self.ext_paint(c.1))
+    }
+}
+
+/// The colour scheme of a zipped theme package, in SpreadsheetML theme index order.
+fn theme_colors(package: Vec<u8>) -> Option<[u32; 12]> {
+    let mut zip = OpcReader::new(Cursor::new(package)).ok()?;
+    let xml = String::from_utf8(zip.read_part(&PartName::new("/theme/theme/theme1.xml").ok()?).ok()?).ok()?;
+    let scheme = &xml[xml.find("clrScheme")?..];
+    let mut declared = [0u32; 12];
+    for (slot, tag) in
+        declared.iter_mut().zip(["dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6", "hlink", "folHlink"])
+    {
+        let body = &scheme[scheme.find(&format!("{tag}>"))?..];
+        let element = &body[..body.find("/>")?];
+        // A system colour keeps its last value; an RGB colour its value.
+        let key = if element.contains("sysClr") { "lastClr=\"" } else { "val=\"" };
+        let hex = &element[element.find(key)? + key.len()..];
+        *slot = u32::from_str_radix(hex.get(..6)?, 16).ok()?;
+    }
+    // SpreadsheetML counts the light colours first.
+    let mut colors = declared;
+    colors.swap(0, 1);
+    colors.swap(2, 3);
+    Some(colors)
+}
+
+/// `rgb` lightened (tint > 0) or darkened (tint < 0) in HLS, as SpreadsheetML tints work.
+fn tinted(rgb: u32, tint: f64) -> u32 {
+    if tint == 0.0 {
+        return rgb;
+    }
+    let [r, g, b] = [rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF].map(|c| f64::from(c) / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let light = (max + min) / 2.0;
+    let (hue, sat) = if max == min {
+        (0.0, 0.0)
+    } else {
+        let d = max - min;
+        let sat = if light > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+        let hue = if max == r {
+            (g - b) / d + if g < b { 6.0 } else { 0.0 }
+        } else if max == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        };
+        (hue / 6.0, sat)
+    };
+    let light = if tint < 0.0 { light * (1.0 + tint) } else { light * (1.0 - tint) + tint };
+    let channel = |t: f64| {
+        if sat == 0.0 {
+            return light;
+        }
+        let q = if light < 0.5 { light * (1.0 + sat) } else { light + sat - light * sat };
+        let p = 2.0 * light - q;
+        let t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    let byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u32;
+    byte(channel(hue + 1.0 / 3.0)) << 16 | byte(channel(hue)) << 8 | byte(channel(hue - 1.0 / 3.0))
 }
 
 impl SheetLayout {
@@ -288,6 +463,8 @@ impl SheetLayout {
         if kind == CONTINUE {
             return;
         }
+        self.formulas.record(kind, data);
+        self.rules.record(kind, data);
         let one = |at| Some((u16_at(data, at)?, u16_at(data, at + 2)?, u16_at(data, at + 4)?));
         match kind {
             COLINFO => {
@@ -441,6 +618,14 @@ macro_rules! w {
     }};
 }
 
+#[path = "xls_formula.rs"]
+mod formula;
+#[path = "xls_rules.rs"]
+mod rules;
+#[cfg(test)]
+#[path = "xls_tests.rs"]
+mod tests;
+
 const NS_MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const NS_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const CT_WORKBOOK: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
@@ -463,6 +648,7 @@ fn write(book: &XlsDocument, layout: &Layout) -> office_oxide::core::Result<Vec<
     opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
     let mut strings = Strings::default();
     let mut media: HashMap<u32, String> = HashMap::new();
+    let mut dxfs = rules::Dxfs::new(layout);
 
     let mut sheets_xml = String::new();
     for (i, (sheet, sheet_layout)) in book.sheets.iter().zip(&layout.sheets).enumerate() {
@@ -470,7 +656,7 @@ fn write(book: &XlsDocument, layout: &Layout) -> office_oxide::core::Result<Vec<
         let target = format!("worksheets/sheet{n}.xml");
         let rid = opc.add_part_rel(&workbook, rel_types::WORKSHEET, &target);
         let name = part(&format!("/xl/{target}"))?;
-        let xml = worksheet(&mut opc, &name, n, sheet, sheet_layout, layout, &mut strings, &mut media)?;
+        let xml = worksheet(&mut opc, &name, n, sheet, sheet_layout, layout, &mut strings, &mut media, &mut dxfs)?;
         opc.add_part(&name, CT_WORKSHEET, xml.as_bytes())?;
         w!(sheets_xml, r#"<sheet name="{}" sheetId="{n}" r:id="{rid}""#, esc(&sheet.name));
         if sheet.hidden {
@@ -491,18 +677,22 @@ fn write(book: &XlsDocument, layout: &Layout) -> office_oxide::core::Result<Vec<
         xml.push_str(r#"<workbookPr date1904="1"/>"#);
     }
     w!(xml, r#"<bookViews><workbookView/></bookViews><sheets>{sheets_xml}</sheets>"#);
-    let names: Vec<_> = book.defined_names.iter().filter(|n| !n.value.is_empty()).collect();
+    // A sheet-level name of a sheet that is not written (a VBA module) has no place to go.
+    let names: Vec<_> = layout.links.names.iter()
+        .filter(|n| usize::from(n.itab) <= book.sheets.len())
+        .filter_map(|n| Some((n, layout.links.name_formula(n)?)))
+        .collect();
     if !names.is_empty() {
         xml.push_str("<definedNames>");
-        for name in names {
+        for (name, formula) in names {
             w!(xml, r#"<definedName name="{}""#, esc(&name.name));
-            if let Some(sheet) = name.local_sheet_id {
+            if let Some(sheet) = name.itab.checked_sub(1) {
                 w!(xml, r#" localSheetId="{sheet}""#);
             }
             if name.hidden {
                 xml.push_str(r#" hidden="1""#);
             }
-            w!(xml, ">{}</definedName>", esc(&name.value));
+            w!(xml, ">{}</definedName>", esc(&formula));
         }
         xml.push_str("</definedNames>");
     }
@@ -510,7 +700,7 @@ fn write(book: &XlsDocument, layout: &Layout) -> office_oxide::core::Result<Vec<
     opc.add_part(&workbook, CT_WORKBOOK, xml.as_bytes())?;
 
     opc.add_part_rel(&workbook, rel_types::STYLES, "styles.xml");
-    opc.add_part(&part("/xl/styles.xml")?, CT_STYLES, styles(layout).as_bytes())?;
+    opc.add_part(&part("/xl/styles.xml")?, CT_STYLES, styles(layout, &dxfs).as_bytes())?;
     opc.add_part_rel(&workbook, rel_types::SHARED_STRINGS, "sharedStrings.xml");
     opc.add_part(&part("/xl/sharedStrings.xml")?, CT_STRINGS, strings.xml().as_bytes())?;
     Ok(opc.finish()?.into_inner())
@@ -586,7 +776,9 @@ fn worksheet(
     layout: &Layout,
     strings: &mut Strings,
     media: &mut HashMap<u32, String>,
+    dxfs: &mut rules::Dxfs,
 ) -> office_oxide::core::Result<String> {
+    let index = n - 1;
     let mut xml = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{NS_MAIN}" xmlns:r="{NS_REL}">"#);
 
     // View: gridlines, right-to-left, frozen panes.
@@ -685,6 +877,7 @@ fn worksheet(
         rows.entry(row).or_insert((0, 0));
     }
     let chart_rows: Vec<&String> = sheet.chart_text.iter().collect();
+    let formulas = sl.formulas.texts(index, &layout.links);
     xml.push_str("<sheetData>");
     for (&row, &(from, to)) in &rows {
         w!(xml, r#"<row r="{}""#, u32::from(row) + 1);
@@ -711,7 +904,7 @@ fn worksheet(
         xml.push('>');
         for &(_, col, xf) in &cells[from..to] {
             let value = sheet.rows.get(row as usize).and_then(|r| r.get(col as usize));
-            cell(&mut xml, row, col, xf, value, layout, strings);
+            cell(&mut xml, row, col, xf, value, formulas.get(&(row, col)), layout, strings);
         }
         xml.push_str("</row>");
     }
@@ -729,6 +922,8 @@ fn worksheet(
         }
         xml.push_str("</mergeCells>");
     }
+    sl.rules.conditional_formats(&mut xml, index, &layout.links, layout, dxfs);
+    sl.rules.data_validations(&mut xml, index, &layout.links);
 
     if !sheet.hyperlinks.is_empty() {
         xml.push_str("<hyperlinks>");
@@ -765,18 +960,48 @@ fn worksheet(
     Ok(xml)
 }
 
-fn cell(xml: &mut String, row: u16, col: u16, xf: u16, value: Option<&CellValue>, layout: &Layout, strings: &mut Strings) {
+#[allow(clippy::too_many_arguments)]
+fn cell(
+    xml: &mut String,
+    row: u16,
+    col: u16,
+    xf: u16,
+    value: Option<&CellValue>,
+    formula: Option<&formula::CellFormula>,
+    layout: &Layout,
+    strings: &mut Strings,
+) {
     w!(xml, r#"<c r="{}""#, cell_ref(row.into(), col.into()));
     if xf != 0 && (xf as usize) < layout.xfs.len() {
         w!(xml, r#" s="{xf}""#);
     }
-    match value {
-        Some(CellValue::Number(v)) if v.is_finite() => w!(xml, "><v>{}</v></c>", number(*v)),
-        Some(CellValue::String(s)) => w!(xml, r#" t="s"><v>{}</v></c>"#, strings.add(s)),
-        Some(CellValue::Bool(b)) => w!(xml, r#" t="b"><v>{}</v></c>"#, u8::from(*b)),
-        Some(err @ CellValue::Error(_)) => w!(xml, r#" t="e"><v>{}</v></c>"#, esc(&err.as_text_cow())),
-        _ => xml.push_str("/>"),
+    let Some(formula) = formula else {
+        match value {
+            Some(CellValue::Number(v)) if v.is_finite() => w!(xml, "><v>{}</v></c>", number(*v)),
+            Some(CellValue::String(s)) => w!(xml, r#" t="s"><v>{}</v></c>"#, strings.add(s)),
+            Some(CellValue::Bool(b)) => w!(xml, r#" t="b"><v>{}</v></c>"#, u8::from(*b)),
+            Some(err @ CellValue::Error(_)) => w!(xml, r#" t="e"><v>{}</v></c>"#, esc(&err.as_text_cow())),
+            _ => xml.push_str("/>"),
+        }
+        return;
+    };
+    // A formula keeps the value Excel last computed; a text result stays in the cell (`str`).
+    let (kind, cached) = match value {
+        Some(CellValue::Number(v)) if v.is_finite() => ("", Some(number(*v))),
+        Some(CellValue::String(s)) => (r#" t="str""#, Some(esc(s).into_owned())),
+        Some(CellValue::Bool(b)) => (r#" t="b""#, Some(u8::from(*b).to_string())),
+        Some(err @ CellValue::Error(_)) => (r#" t="e""#, Some(esc(&err.as_text_cow()).into_owned())),
+        _ => ("", None),
+    };
+    w!(xml, "{kind}><f");
+    if let Some(range) = &formula.array {
+        w!(xml, r#" t="array" ref="{range}""#);
     }
+    w!(xml, ">{}</f>", esc(&formula.text));
+    if let Some(cached) = cached {
+        w!(xml, "<v>{cached}</v>");
+    }
+    xml.push_str("</c>");
 }
 
 /// The sheet's pictures as a drawing part; the relationship id for `<drawing>`, or `None` when it has none.
@@ -889,9 +1114,11 @@ fn comments(opc: &mut Opc, sheet_part: &PartName, n: usize, sheet: &Sheet) -> of
     Ok(opc.add_part_rel(sheet_part, rel_types::VML_DRAWING, &format!("../drawings/vmlDrawing{n}.vml")))
 }
 
-/// `xl/styles.xml`: one cell format per BIFF `XF`, in the same order, so cells keep their `XF` index.
-// Limit: colours chosen in Excel 2007+ (XFEXT theme and RGB colours) show as the nearest palette colour the XF also stores; reading XFEXT records lifts it.
-fn styles(layout: &Layout) -> String {
+/// `xl/styles.xml`: one cell format per BIFF `XF`, in the same order, so cells keep their `XF` index. The
+/// Excel 2007 colours of `XFEXT` (RGB, or theme colours resolved with their tint) replace the nearest
+/// palette colours the XF also stores.
+// Limit: XFEXT gradient fills show as the XF's pattern fill; writing <gradientFill> lifts it.
+fn styles(layout: &Layout, dxfs: &rules::Dxfs) -> String {
     let mut xml = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="{NS_MAIN}">"#);
 
     if !layout.formats.is_empty() {
@@ -902,49 +1129,18 @@ fn styles(layout: &Layout) -> String {
         xml.push_str("</numFmts>");
     }
 
-    w!(xml, r#"<fonts count="{}">"#, layout.fonts.len().max(1));
-    if layout.fonts.is_empty() {
-        xml.push_str(r#"<font><sz val="10"/><name val="Arial"/></font>"#);
+    // Fonts in FONT order; an XF whose XFEXT colours its text gets a copy of its font in that colour.
+    let mut fonts: Vec<String> = layout.fonts.iter().map(|f| font_xml(f, layout.rgb(f.color).map(Paint::Rgb))).collect();
+    if fonts.is_empty() {
+        fonts.push(r#"<font><sz val="10"/><name val="Arial"/></font>"#.into());
     }
-    for f in &layout.fonts {
-        xml.push_str("<font>");
-        for (on, tag) in [(f.bold, "<b/>"), (f.italic, "<i/>"), (f.strike, "<strike/>"), (f.outline, "<outline/>"), (f.shadow, "<shadow/>")] {
-            if on {
-                xml.push_str(tag);
-            }
-        }
-        match f.underline {
-            0 => {},
-            0x02 => xml.push_str(r#"<u val="double"/>"#),
-            0x21 => xml.push_str(r#"<u val="singleAccounting"/>"#),
-            0x22 => xml.push_str(r#"<u val="doubleAccounting"/>"#),
-            _ => xml.push_str("<u/>"),
-        }
-        match f.script {
-            1 => xml.push_str(r#"<vertAlign val="superscript"/>"#),
-            2 => xml.push_str(r#"<vertAlign val="subscript"/>"#),
-            _ => {},
-        }
-        w!(xml, r#"<sz val="{}"/>"#, points(f64::from(f.twips)));
-        if let Some(rgb) = layout.rgb(f.color) {
-            w!(xml, r#"<color rgb="FF{rgb:06X}"/>"#);
-        }
-        w!(xml, r#"<name val="{}"/>"#, esc(&f.name));
-        if f.family > 0 {
-            w!(xml, r#"<family val="{}"/>"#, f.family);
-        }
-        if f.charset > 0 {
-            w!(xml, r#"<charset val="{}"/>"#, f.charset);
-        }
-        xml.push_str("</font>");
-    }
-    xml.push_str("</fonts>");
+    let base_fonts = fonts.len();
 
     // Fills and borders, each distinct one once; SpreadsheetML reserves fills 0 and 1.
-    let mut fills: Vec<(u32, u16, u16)> = Vec::new();
-    let mut borders: Vec<(u32, u32)> = Vec::new();
+    let mut fills: Vec<String> = Vec::new();
+    let mut borders: Vec<String> = Vec::new();
     let mut xfs = String::new();
-    for xf in &layout.xfs {
+    for (i, xf) in layout.xfs.iter().enumerate() {
         let at16 = |i: usize| u16::from_le_bytes([xf[i], xf[i + 1]]);
         let at32 = |i: usize| u32::from_le_bytes([xf[i], xf[i + 1], xf[i + 2], xf[i + 3]]);
         let (font, numfmt, protect) = (at16(0), at16(2), at16(4));
@@ -953,26 +1149,27 @@ fn styles(layout: &Layout) -> String {
             f if f >= 4 => f - 1, // BIFF skips font index 4
             f => f,
         };
-        let font = if (font as usize) < layout.fonts.len() { font } else { 0 };
+        let font = if (font as usize) < layout.fonts.len() { usize::from(font) } else { 0 };
+        let font = match (layout.xf_paint(i, 13), layout.fonts.get(font)) {
+            (Some(paint), Some(f)) => intern(&mut fonts, font_xml(f, Some(paint)), base_fonts),
+            _ => font,
+        };
         let pattern = edge >> 26;
         let fill = if pattern == 0 {
             0
         } else {
-            let key = (pattern, colors & 0x7F, (colors >> 7) & 0x7F);
-            2 + fills.iter().position(|f| *f == key).unwrap_or_else(|| {
-                fills.push(key);
-                fills.len() - 1
-            })
+            let fore = layout.xf_paint(i, 4).unwrap_or_else(|| layout.paint(colors & 0x7F));
+            let back = layout.xf_paint(i, 5).unwrap_or_else(|| layout.paint((colors >> 7) & 0x7F));
+            let mut fill = format!(r#"<fill><patternFill patternType="{}">"#, PATTERNS.get(pattern as usize).unwrap_or(&"solid"));
+            paint(&mut fill, "fgColor", fore);
+            paint(&mut fill, "bgColor", back);
+            fill.push_str("</patternFill></fill>");
+            2 + intern(&mut fills, fill, 0)
         };
-        // Border: line styles and colours, minus the fill pattern bits.
-        let key = (line, edge & 0x01FF_FFFF);
-        let border = if key.0 & 0xFFFF == 0 && (key.1 >> 21) & 0xF == 0 {
+        let border = if line & 0xFFFF == 0 && (edge >> 21) & 0xF == 0 {
             0
         } else {
-            1 + borders.iter().position(|b| *b == key).unwrap_or_else(|| {
-                borders.push(key);
-                borders.len() - 1
-            })
+            1 + intern(&mut borders, border_xml(i, line, edge, layout), 0)
         };
         w!(
             xfs,
@@ -1012,59 +1209,114 @@ fn styles(layout: &Layout) -> String {
         xfs.push_str("</xf>");
     }
 
-    w!(xml, r#"<fills count="{}"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>"#, fills.len() + 2);
-    for &(pattern, fore, back) in &fills {
-        w!(xml, r#"<fill><patternFill patternType="{}">"#, PATTERNS.get(pattern as usize).unwrap_or(&"solid"));
-        color(&mut xml, "fgColor", fore, layout);
-        color(&mut xml, "bgColor", back, layout);
-        xml.push_str("</patternFill></fill>");
-    }
-    w!(xml, r#"</fills><borders count="{}"><border><left/><right/><top/><bottom/><diagonal/></border>"#, borders.len() + 1);
-    for &(line, edge) in &borders {
-        let diagonal = line >> 30;
-        xml.push_str("<border");
-        if diagonal & 2 != 0 {
-            xml.push_str(r#" diagonalUp="1""#);
-        }
-        if diagonal & 1 != 0 {
-            xml.push_str(r#" diagonalDown="1""#);
-        }
-        xml.push('>');
-        let sides = [
-            ("left", line & 0xF, (line >> 16) & 0x7F),
-            ("right", (line >> 4) & 0xF, (line >> 23) & 0x7F),
-            ("top", (line >> 8) & 0xF, edge & 0x7F),
-            ("bottom", (line >> 12) & 0xF, (edge >> 7) & 0x7F),
-            ("diagonal", (edge >> 21) & 0xF, (edge >> 14) & 0x7F),
-        ];
-        for (side, style, icv) in sides {
-            match BORDER_STYLES.get(style as usize) {
-                Some(&name) if style != 0 => {
-                    w!(xml, r#"<{side} style="{name}">"#);
-                    color(&mut xml, "color", icv as u16, layout);
-                    w!(xml, "</{side}>");
-                },
-                _ => w!(xml, "<{side}/>"),
-            }
-        }
-        xml.push_str("</border>");
-    }
+    w!(xml, r#"<fonts count="{}">{}</fonts>"#, fonts.len(), fonts.concat());
+    w!(
+        xml,
+        r#"<fills count="{}"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>{}</fills>"#,
+        fills.len() + 2,
+        fills.concat()
+    );
+    w!(xml, r#"<borders count="{}"><border><left/><right/><top/><bottom/><diagonal/></border>{}"#, borders.len() + 1, borders.concat());
     xml.push_str(r#"</borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>"#);
     w!(xml, r#"<cellXfs count="{}">"#, layout.xfs.len().max(1));
     if layout.xfs.is_empty() {
         xml.push_str(r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>"#);
     }
     xml.push_str(&xfs);
-    xml.push_str(r#"</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#);
+    w!(xml, r#"</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>{}</styleSheet>"#, dxfs.xml());
+    xml
+}
+
+/// The index of `xml` in `list` at or after `from`, added when it is new.
+fn intern(list: &mut Vec<String>, xml: String, from: usize) -> usize {
+    match list[from..].iter().position(|x| *x == xml) {
+        Some(i) => from + i,
+        None => {
+            list.push(xml);
+            list.len() - 1
+        },
+    }
+}
+
+/// A `<font>`, coloured `color` when given.
+fn font_xml(f: &Font, color: Option<Paint>) -> String {
+    let mut xml = String::from("<font>");
+    for (on, tag) in [(f.bold, "<b/>"), (f.italic, "<i/>"), (f.strike, "<strike/>"), (f.outline, "<outline/>"), (f.shadow, "<shadow/>")] {
+        if on {
+            xml.push_str(tag);
+        }
+    }
+    match f.underline {
+        0 => {},
+        0x02 => xml.push_str(r#"<u val="double"/>"#),
+        0x21 => xml.push_str(r#"<u val="singleAccounting"/>"#),
+        0x22 => xml.push_str(r#"<u val="doubleAccounting"/>"#),
+        _ => xml.push_str("<u/>"),
+    }
+    match f.script {
+        1 => xml.push_str(r#"<vertAlign val="superscript"/>"#),
+        2 => xml.push_str(r#"<vertAlign val="subscript"/>"#),
+        _ => {},
+    }
+    w!(xml, r#"<sz val="{}"/>"#, points(f64::from(f.twips)));
+    // An automatic text colour stays unwritten.
+    if let Some(color) = color.filter(|c| !matches!(c, Paint::Auto)) {
+        paint(&mut xml, "color", color);
+    }
+    w!(xml, r#"<name val="{}"/>"#, esc(&f.name));
+    if f.family > 0 {
+        w!(xml, r#"<family val="{}"/>"#, f.family);
+    }
+    if f.charset > 0 {
+        w!(xml, r#"<charset val="{}"/>"#, f.charset);
+    }
+    xml.push_str("</font>");
+    xml
+}
+
+/// XF `xf`'s `<border>`: line styles from the XF, colours from `XFEXT` or the palette.
+fn border_xml(xf: usize, line: u32, edge: u32, layout: &Layout) -> String {
+    let diagonal = line >> 30;
+    let mut xml = String::from("<border");
+    if diagonal & 2 != 0 {
+        xml.push_str(r#" diagonalUp="1""#);
+    }
+    if diagonal & 1 != 0 {
+        xml.push_str(r#" diagonalDown="1""#);
+    }
+    xml.push('>');
+    // Side, line style, palette colour, XFEXT extension type.
+    let sides = [
+        ("left", line & 0xF, (line >> 16) & 0x7F, 9),
+        ("right", (line >> 4) & 0xF, (line >> 23) & 0x7F, 10),
+        ("top", (line >> 8) & 0xF, edge & 0x7F, 7),
+        ("bottom", (line >> 12) & 0xF, (edge >> 7) & 0x7F, 8),
+        ("diagonal", (edge >> 21) & 0xF, (edge >> 14) & 0x7F, 11),
+    ];
+    for (side, style, icv, ext) in sides {
+        match BORDER_STYLES.get(style as usize) {
+            Some(&name) if style != 0 => {
+                w!(xml, r#"<{side} style="{name}">"#);
+                paint(&mut xml, "color", layout.xf_paint(xf, ext).unwrap_or_else(|| layout.paint(icv as u16)));
+                w!(xml, "</{side}>");
+            },
+            _ => w!(xml, "<{side}/>"),
+        }
+    }
+    xml.push_str("</border>");
     xml
 }
 
 /// `<tag rgb=.../>` for a palette colour; system colours keep their SpreadsheetML index (64 window
 /// text, 65 window background).
 fn color(xml: &mut String, tag: &str, icv: u16, layout: &Layout) {
-    match layout.rgb(icv) {
-        Some(rgb) => w!(xml, r#"<{tag} rgb="FF{rgb:06X}"/>"#),
-        None if icv == 64 || icv == 65 => w!(xml, r#"<{tag} indexed="{icv}"/>"#),
-        None => w!(xml, r#"<{tag} auto="1"/>"#),
+    paint(xml, tag, layout.paint(icv));
+}
+
+fn paint(xml: &mut String, tag: &str, paint: Paint) {
+    match paint {
+        Paint::Rgb(rgb) => w!(xml, r#"<{tag} rgb="FF{rgb:06X}"/>"#),
+        Paint::System(icv) => w!(xml, r#"<{tag} indexed="{icv}"/>"#),
+        Paint::Auto => w!(xml, r#"<{tag} auto="1"/>"#),
     }
 }

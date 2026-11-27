@@ -94,6 +94,9 @@ interface Pages {
     /** Page [index] about [width] pixels wide, or null past the last page. */
     suspend fun render(index: Int, width: Int): Bitmap?
 
+    /** Matches of [query] in page order, at most [limit]; stops between pages once its coroutine is cancelled. */
+    suspend fun find(query: String, limit: Int): List<PageHit>
+
     /** Frees the file once any render in flight has finished. */
     fun closeLater()
 }
@@ -113,6 +116,7 @@ fun PagedViewer(
     onTap: () -> Unit,
     onStatus: (String) -> Unit,
     onFirstPage: (Bitmap) -> Unit,
+    find: FindState,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val screenWidth = maxWidth
@@ -128,6 +132,24 @@ fun PagedViewer(
         var shown by remember(doc) { mutableIntStateOf(doc.pageCount ?: 1) }
         var thumbSaved by remember(doc) { mutableStateOf(false) }
         var pagesSheet by remember { mutableStateOf(false) }
+        val density = LocalDensity.current
+        val hits = rememberHits<PageHit>(
+            find, doc,
+            startAt = { found -> found.firstAtOrAfter(list.firstVisibleItemIndex) { it.page } },
+            pagesOnly = { found -> found.all { it.boxes.isEmpty() } },
+        ) { query -> doc.find(query, MAX_FIND_HITS) }
+        val hitsOnPage = remember(hits) { hits.indices.groupBy { hits[it].page } }
+        LaunchedEffect(hits, find.moves) {
+            val hit = hits.getOrNull(find.current) ?: return@LaunchedEffect
+            if (lastPage == null) shown = maxOf(shown, hit.page + 1)
+            val box = hit.boxes.firstOrNull() ?: return@LaunchedEffect list.animateScrollToItem(hit.page)
+            // The match lands a third of the way down the screen and, when zoomed in, across into view.
+            val pageWidth = with(density) { (screenWidth * zoom - 24.dp).toPx() }
+            val px = box.scaled(pageWidth, pageWidth / (aspects[hit.page] ?: aspects[0] ?: (1 / 1.414f)))
+            list.animateScrollToItem(hit.page, (px.top - list.layoutInfo.viewportSize.height / 3).toInt().coerceAtLeast(0))
+            val left = px.left + with(density) { 12.dp.toPx() } - hScroll.viewportSize / 3
+            hScroll.animateScrollTo(left.toInt().coerceIn(0, hScroll.maxValue))
+        }
 
         // Scales around [centroid], so the point under the fingers stays put.
         fun zoomBy(factor: Float, centroid: Offset) {
@@ -214,6 +236,7 @@ fun PagedViewer(
                                 .semantics { contentDescription = "Page ${i + 1}" + (lastPage?.let { " of $it" } ?: "") },
                         ) {
                             page?.let { Image(it, null, Modifier.fillMaxSize().graphicsLayer { this.alpha = alpha }, contentScale = ContentScale.FillBounds) }
+                            hitsOnPage[i]?.let { PageHighlights(hits, it, find.current) }
                         }
                     }
                 }

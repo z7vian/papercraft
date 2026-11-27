@@ -9,26 +9,39 @@ use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 
-use betteroffice_docx::{Document, PngTarget, RenderOptions};
+use docx_edit::{
+    ColorPatch, EditCtx, EditingDoc, FontFamilyPatch, FormatPolicy, InlineFormatDelta, ParaAttrDelta, ParaSelector,
+    Patch as Change, Position, SegmentContent, StoryRange, StrikePatch, UnderlinePatch,
+};
 use docx_parse::BlockContent;
+use docx_parse::document::{DocumentBody, Section};
 use docx_parse::formatting::{NumberingProperties, TextFormatting};
 use docx_parse::inline::{DirectionScope, InlineNode, Run, RunContent, RunType};
 use docx_parse::paragraph::{Paragraph, ParagraphContent, TrackedInline};
+use docx_parse::s9::{S9DocumentBodyWire, S9PackageWire};
 use docx_parse::scalars::{ColorValue, UnderlineValue};
+use docx_parse::serializer::{
+    S13ParagraphIds, S13SaveOptions, S13SaveRequest, S13SpliceAnchor, S13SplicedPart, SerializerDeterminism,
+    write_docx_s13_parts_with_report,
+};
 use docx_parse::styles::{DocDefaults, Style, StyleDefinitions};
+use docx_parse::xml::{ParseBudget, ParseLimits};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::CoreError;
+use crate::office::docx::Words;
 use crate::office::{OfficeFamily, convert};
 
 /// Undo steps kept; the oldest drops first.
 const HISTORY: usize = 100;
 // Parsing and layout recurse on nested content, like the viewer's engine thread.
 const ENGINE_STACK: usize = 32 * 1024 * 1024;
-/// Scale of the throwaway renders that count pages.
-const PROBE_SCALE: f32 = 0.05;
 /// What a picture, symbol or note mark reads as in a paragraph's text.
 const OBJECT: &str = "\u{fffc}";
 const PAGE_BREAK: &str = "\u{c}";
+/// The clock a save writes with; it stamps nothing while the modified date is left alone.
+const SAVE_TIME: &str = "1970-01-01T00:00:00.000Z";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum DocAlign {
@@ -104,7 +117,8 @@ pub struct DocRange {
     pub end: DocPosition,
 }
 
-/// Character formatting to set; `None` leaves that property as it is.
+/// Character formatting to change: a `Some` property is set, a property listed in `clear` goes back to what
+/// the paragraph and character styles give, and every other property stays as it is.
 #[derive(Clone, Debug, Default, PartialEq, uniffi::Record)]
 pub struct DocRunFormat {
     pub bold: Option<bool>,
@@ -116,6 +130,21 @@ pub struct DocRunFormat {
     /// `RRGGBB` (a leading `#` is fine) or `auto`.
     pub color: Option<String>,
     pub font: Option<String>,
+    /// Properties to clear; one that is also set is refused.
+    #[uniffi(default)]
+    pub clear: Vec<DocRunProperty>,
+}
+
+/// One property of [`DocRunFormat`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DocRunProperty {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Size,
+    Color,
+    Font,
 }
 
 /// A Word document open for editing. One thread owns the engine and runs every call on it.
@@ -155,8 +184,9 @@ impl DocEditor {
     fn edit(
         &self,
         change: impl FnOnce(&mut Vec<BlockContent>) -> Result<(), CoreError> + Send + 'static,
+        mirror: Mirror,
     ) -> Result<(), CoreError> {
-        self.ask(move |editor| editor.edit(change))
+        self.ask(move |editor| editor.edit(change, mirror))
     }
 }
 
@@ -195,14 +225,17 @@ impl DocEditor {
     }
 
     pub fn paragraph_count(&self) -> Result<u32, CoreError> {
-        self.ask(|editor| Ok(editor.doc.paragraphs().len() as u32))
+        self.ask(|editor| {
+            let mut count = 0;
+            each_paragraph(&editor.body.content, &mut |_| count += 1);
+            Ok(count)
+        })
     }
 
     pub fn paragraph(&self, index: u32) -> Result<DocParagraph, CoreError> {
         self.ask(move |editor| {
-            let book = StyleBook::new(editor.doc.model().styles.as_ref());
-            let paragraphs = editor.doc.paragraphs();
-            let paragraph = paragraphs.get(index as usize).ok_or_else(|| no_paragraph(index))?;
+            let book = StyleBook::new(editor.package.styles.as_ref());
+            let paragraph = nth_paragraph(&editor.body.content, index).ok_or_else(|| no_paragraph(index))?;
             Ok(read_paragraph(paragraph, index, &book))
         })
     }
@@ -210,9 +243,9 @@ impl DocEditor {
     /// The whole body: paragraphs and tables in order.
     pub fn blocks(&self) -> Result<Vec<DocBlock>, CoreError> {
         self.ask(|editor| {
-            let book = StyleBook::new(editor.doc.model().styles.as_ref());
+            let book = StyleBook::new(editor.package.styles.as_ref());
             let mut blocks = Vec::new();
-            read_blocks(&editor.doc.body().content, &book, &mut 0, &mut blocks);
+            read_blocks(&editor.body.content, &book, &mut 0, &mut blocks);
             Ok(blocks)
         })
     }
@@ -220,7 +253,7 @@ impl DocEditor {
     /// Paragraph styles a user can pick, in the file's order.
     pub fn styles(&self) -> Result<Vec<DocStyle>, CoreError> {
         self.ask(|editor| {
-            let styles = editor.doc.model().styles.as_ref().map(|defs| defs.styles.as_slice()).unwrap_or_default();
+            let styles = editor.package.styles.as_ref().map(|defs| defs.styles.as_slice()).unwrap_or_default();
             Ok(styles
                 .iter()
                 .filter(|s| s.style_type == "paragraph" && s.hidden != Some(true) && s.semi_hidden != Some(true))
@@ -232,36 +265,38 @@ impl DocEditor {
     /// Replaces the text in `range` with `text`, which takes the look of the first replaced character
     /// (or of the character before an empty range). `\t`, `\n` and `\u{c}` become a tab, a line break and a page break.
     pub fn replace_text(&self, range: DocRange, text: String) -> Result<(), CoreError> {
-        self.edit(move |content| replace(content, range, &text))
+        let mirror = Mirror::Text { range, text: text.clone() };
+        self.edit(move |content| replace(content, range, &text), mirror)
     }
 
     /// Inserts a paragraph so it becomes paragraph `index`, styled like the paragraph it goes before
     /// (or after, when `index` is the paragraph count).
     pub fn insert_paragraph(&self, index: u32, text: String) -> Result<(), CoreError> {
-        self.edit(move |content| insert_paragraph(content, index, &text))
+        self.edit(move |content| insert_paragraph(content, index, &text), Mirror::Reopen)
     }
 
     pub fn delete_paragraph(&self, index: u32) -> Result<(), CoreError> {
-        self.edit(move |content| delete_paragraph(content, index))
+        self.edit(move |content| delete_paragraph(content, index), Mirror::Reopen)
     }
 
     /// Splits a paragraph at `at`, as Enter does; the second half becomes paragraph `at.paragraph + 1`.
     pub fn split_paragraph(&self, at: DocPosition) -> Result<(), CoreError> {
-        self.edit(move |content| split_paragraph(content, at))
+        self.edit(move |content| split_paragraph(content, at), Mirror::Reopen)
     }
 
     /// Joins paragraph `index` with the paragraph after it, keeping the first one's look.
     pub fn merge_paragraph(&self, index: u32) -> Result<(), CoreError> {
-        self.edit(move |content| merge_paragraph(content, index))
+        self.edit(move |content| merge_paragraph(content, index), Mirror::Reopen)
     }
 
     pub fn set_run_format(&self, range: DocRange, format: DocRunFormat) -> Result<(), CoreError> {
         let patch = Patch::new(format)?;
-        self.edit(move |content| set_run_format(content, range, &patch))
+        let mirror = Mirror::Format { range, touched: patch.touched() };
+        self.edit(move |content| set_run_format(content, range, &patch), mirror)
     }
 
     pub fn set_alignment(&self, index: u32, alignment: DocAlign) -> Result<(), CoreError> {
-        self.edit(move |content| {
+        let change = move |content: &mut Vec<BlockContent>| {
             let at = spot(content, index)?;
             let formatting = paragraph_mut(content, &at)?.formatting.get_or_insert_with(Default::default);
             formatting.alignment = Some(
@@ -274,23 +309,25 @@ impl DocEditor {
                 .to_owned(),
             );
             Ok(())
-        })
+        };
+        self.edit(change, Mirror::Align { index })
     }
 
     /// Sets paragraph `index`'s style to `style_id`, one of [`Self::styles`].
     pub fn set_style(&self, index: u32, style_id: String) -> Result<(), CoreError> {
         self.ask(move |editor| {
-            let known = editor.doc.model().styles.as_ref().is_some_and(|defs| {
+            let known = editor.package.styles.as_ref().is_some_and(|defs| {
                 defs.styles.iter().any(|s| s.style_type == "paragraph" && s.style_id == style_id)
             });
             if !known {
                 return Err(refuse("This document has no such paragraph style."));
             }
-            editor.edit(move |content| {
+            let change = move |content: &mut Vec<BlockContent>| {
                 let at = spot(content, index)?;
                 paragraph_mut(content, &at)?.formatting.get_or_insert_with(Default::default).style_id = Some(style_id);
                 Ok(())
-            })
+            };
+            editor.edit(change, Mirror::Reopen)
         })
     }
 
@@ -322,17 +359,24 @@ impl DocEditor {
         self.ask(|editor| Ok(editor.state != 0))
     }
 
-    /// Pages of the edited document.
+    /// Pages of the edited document, read from its retained layout.
     pub fn page_count(&self) -> Result<u32, CoreError> {
-        self.ask(|editor| editor.page_count())
+        self.ask(|editor| Ok(editor.words()?.page_total()))
     }
 
     /// PNG of page `index` of the edited document at `scale` (1.0 is 96 dpi), or `None` past the last page.
     pub fn render_page(&self, index: u32, scale: f32) -> Result<Option<Vec<u8>>, CoreError> {
-        self.ask(move |editor| editor.render(index, scale))
+        self.ask(move |editor| {
+            #[cfg(test)]
+            {
+                editor.view.draws += 1;
+            }
+            editor.words()?.render_page(index, scale)
+        })
     }
 
-    /// The document as .docx bytes. Without net edits these are the opened bytes unchanged.
+    /// The document as .docx bytes. Without net edits these are the opened bytes unchanged; with edits, the
+    /// paragraphs no edit touched keep their source bytes where the engine can splice the changed ones in.
     pub fn save(&self) -> Result<Vec<u8>, CoreError> {
         self.ask(|editor| editor.save())
     }
@@ -343,50 +387,109 @@ struct Snapshot {
     state: u64,
 }
 
-/// The engine's document plus the edit history. Lives on the editor thread.
+/// The parsed document plus the edit history and the retained layout. Lives on the editor thread.
 struct Editor {
-    doc: Document,
+    body: DocumentBody,
+    /// Everything else the file parsed to; its body is moved out to [`Self::body`].
+    package: S9PackageWire,
+    /// The body content as opened, to tell the paragraphs edits changed from those they left alone.
+    opened: Vec<BlockContent>,
     /// The .docx as opened (converted for a .doc), saved as is while no edit is in effect.
     origin: Vec<u8>,
+    /// `origin`'s parts, inflated.
+    parts: Vec<(String, Vec<u8>)>,
+    /// The main document part and the SHA-256 of its source, which the paragraph splice checks.
+    part: String,
+    part_sha256: String,
+    /// SHA-256 of `origin`: the seed of the IDs a save allocates.
+    seed: String,
     converted: bool,
     undo: VecDeque<Snapshot>,
     redo: Vec<Snapshot>,
     /// Names the body now in effect; 0 is the body as opened.
     state: u64,
     last_state: u64,
-    pages: Option<u32>,
+    view: View,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn body_from_wire(wire: S9DocumentBodyWire) -> DocumentBody {
+    let S9DocumentBodyWire { content, sections, final_section_properties, custom_root_bindings, comments } = wire;
+    let sections = sections.map(|sections| {
+        sections
+            .into_iter()
+            .map(|section| Section {
+                id: section.id,
+                properties: section.properties,
+                content: content.get(section.content_start..section.content_end).unwrap_or_default().to_vec(),
+            })
+            .collect()
+    });
+    DocumentBody { content, sections, final_section_properties, custom_root_bindings, comments }
 }
 
 impl Editor {
     fn open(bytes: Vec<u8>) -> Result<Self, CoreError> {
         let converted = !bytes.starts_with(b"PK");
         let bytes = if converted { convert::to_ooxml(bytes, OfficeFamily::Document)? } else { bytes };
-        let doc = Document::open(&bytes).map_err(|e| CoreError::BadFile(format!("Can't read this document: {e}")))?;
+        let unreadable = |e: docx_parse::xml::ParseError| CoreError::BadFile(format!("Can't read this document: {e}"));
+        let limits = ParseLimits::default();
+        let (envelope, parts) = docx_parse::parse_docx_s9_wire_parts_with_limits(
+            &bytes,
+            docx_parse::S9ParseOptions { source_ordinals: true, ..Default::default() },
+            &limits,
+        )
+        .map_err(unreadable)?;
+        let mut package = envelope.document.package;
+        let layout = Words::layout_package_json(&package)?;
+        let empty = S9DocumentBodyWire {
+            content: Vec::new(),
+            sections: None,
+            final_section_properties: None,
+            custom_root_bindings: Vec::new(),
+            comments: None,
+        };
+        let body = body_from_wire(std::mem::replace(&mut package.document, empty));
+        let part = docx_parse::relationships::office_document_path(&parts, &mut ParseBudget::new(&limits))
+            .map_err(unreadable)?;
+        let part_sha256 = parts.iter().find(|(name, _)| *name == part).map(|(_, xml)| sha256_hex(xml)).unwrap_or_default();
         Ok(Self {
-            doc,
+            opened: body.content.clone(),
+            body,
+            package,
+            seed: sha256_hex(&bytes),
             origin: bytes,
+            parts,
+            part,
+            part_sha256,
             converted,
             undo: VecDeque::new(),
             redo: Vec::new(),
             state: 0,
             last_state: 0,
-            pages: None,
+            view: View { package: layout, words: None, pending: false, #[cfg(test)] opens: 0, #[cfg(test)] draws: 0 },
         })
     }
 
-    /// Runs `change` on a copy of the body (paragraphs are shared until changed) and keeps it only if it succeeds.
-    // Limit: an edited save rewrites the body, notes, headers and footers from the model (the engine's
-    // whole-model write), so markup the model does not carry can drop; saving through the engine's
-    // paragraph-patch session lifts it.
-    fn edit(&mut self, change: impl FnOnce(&mut Vec<BlockContent>) -> Result<(), CoreError>) -> Result<(), CoreError> {
-        let mut content = self.doc.body().content.clone();
+    /// Runs `change` on a copy of the body (paragraphs are shared until changed) and keeps it only if it
+    /// succeeds, then mirrors it into the retained layout.
+    fn edit(
+        &mut self,
+        change: impl FnOnce(&mut Vec<BlockContent>) -> Result<(), CoreError>,
+        mirror: Mirror,
+    ) -> Result<(), CoreError> {
+        let mut content = self.body.content.clone();
         change(&mut content)?;
-        let before = std::mem::replace(&mut self.doc.model_mut().body.content, content);
+        let before = std::mem::replace(&mut self.body.content, content);
+        let book = StyleBook::new(self.package.styles.as_ref());
+        self.view.mirror(&mirror, &before, &self.body.content, &book);
         self.remember(Snapshot { content: before, state: self.state });
         self.redo.clear();
         self.last_state += 1;
         self.state = self.last_state;
-        self.pages = None;
         Ok(())
     }
 
@@ -397,64 +500,424 @@ impl Editor {
         self.undo.push_back(snapshot);
     }
 
+    // Limit: undo and redo lay the document out again from its save; replaying the engine's own undo stack in
+    // step with the model's lifts it.
     fn undo(&mut self) -> bool {
         let Some(snapshot) = self.undo.pop_back() else { return false };
-        let current = std::mem::replace(&mut self.doc.model_mut().body.content, snapshot.content);
+        let current = std::mem::replace(&mut self.body.content, snapshot.content);
         self.redo.push(Snapshot { content: current, state: self.state });
         self.state = snapshot.state;
-        self.pages = None;
+        self.view.words = None;
         true
     }
 
     fn redo(&mut self) -> bool {
         let Some(snapshot) = self.redo.pop() else { return false };
-        let current = std::mem::replace(&mut self.doc.model_mut().body.content, snapshot.content);
+        let current = std::mem::replace(&mut self.body.content, snapshot.content);
         self.remember(Snapshot { content: current, state: self.state });
         self.state = snapshot.state;
-        self.pages = None;
+        self.view.words = None;
         true
+    }
+
+    /// The retained layout of the document as it is now: laid out again only where mirrored edits changed it,
+    /// or opened from the save when an edit could not be mirrored.
+    fn words(&mut self) -> Result<&Words, CoreError> {
+        if self.view.pending {
+            self.view.pending = false;
+            if let Some(words) = self.view.words.as_mut()
+                && words.relayout(&self.view.package).is_err()
+            {
+                self.view.words = None;
+            }
+        }
+        if self.view.words.is_none() {
+            let saved;
+            let bytes: &[u8] = if self.state == 0 {
+                &self.origin
+            } else {
+                saved = self.save()?;
+                &saved
+            };
+            let words = Words::open_retained(bytes)?;
+            #[cfg(test)]
+            {
+                self.view.opens += 1;
+            }
+            self.view.words = Some(words);
+        }
+        Ok(self.view.words.as_ref().expect("the layout was opened above"))
     }
 
     fn save(&self) -> Result<Vec<u8>, CoreError> {
         if self.state == 0 {
             return Ok(self.origin.clone());
         }
-        self.doc.save().map_err(|e| CoreError::BadFile(format!("Can't save this document: {e}")))
-    }
-
-    // Limit: every render lays the whole edited document out again; the engine's retained-layout session lifts it.
-    fn render(&self, index: u32, scale: f32) -> Result<Option<Vec<u8>>, CoreError> {
-        match self.doc.render_png(PngTarget { page: index as usize }, &RenderOptions { scale }) {
-            Ok(page) => Ok(Some(page.bytes)),
-            Err(e) if e.to_string() == format!("page ordinal {index} is out of range") => Ok(None),
-            Err(e) => Err(CoreError::BadFile(format!("Can't draw this document: {e}"))),
-        }
-    }
-
-    // Limit: the engine has no page count, so this renders tiny pages about 2·log2(pages) times;
-    // the engine's retained-layout session lifts it.
-    fn page_count(&mut self) -> Result<u32, CoreError> {
-        if let Some(pages) = self.pages {
-            return Ok(pages);
-        }
-        let has = |page: u32| self.render(page, PROBE_SCALE).map(|png| png.is_some());
-        let pages = if has(0)? {
-            // Pages 0..low exist and page high - 1 does not.
-            let (mut low, mut high) = (1u32, 2u32);
-            while has(high - 1)? {
-                low = high;
-                high = high.checked_mul(2).ok_or_else(|| refuse("This document has too many pages."))?;
-            }
-            while high - low > 1 {
-                let mid = low + (high - low) / 2;
-                if has(mid - 1)? { low = mid } else { high = mid }
-            }
-            low
-        } else {
-            0
+        let package = &self.package;
+        let request = S13SaveRequest {
+            determinism: SerializerDeterminism { seed: self.seed.clone(), now: SAVE_TIME.to_owned() },
+            document: self.body.clone(),
+            header_entries: package.header_entries.clone().unwrap_or_default(),
+            footer_entries: package.footer_entries.clone().unwrap_or_default(),
+            footnotes: package.footnotes.clone().unwrap_or_default(),
+            endnotes: package.endnotes.clone().unwrap_or_default(),
+            footnote_separators: package.footnote_separators.clone().unwrap_or_default(),
+            endnote_separators: package.endnote_separators.clone().unwrap_or_default(),
+            relationship_entries: package.relationship_entries.clone(),
+            numbering: Some(package.numbering.clone()),
+            options: S13SaveOptions { update_modified_date: false, modified_by: None },
+            selective: None,
+            paragraph_ids: self
+                .splice()
+                .map(|part| S13ParagraphIds { spliced_parts: vec![part], ..Default::default() }),
         };
-        self.pages = Some(pages);
-        Ok(pages)
+        write_docx_s13_parts_with_report(request, &self.parts, Some(&self.origin))
+            .map(|(bytes, _)| bytes)
+            .map_err(|e| CoreError::BadFile(format!("Can't save this document: {e}")))
+    }
+
+    /// The splice plan of the main document part: its source XML with only the changed paragraphs written
+    /// again, removed ones dropped and new ones placed. The engine writes the whole part from the model instead
+    /// when the plan does not hold up against the source; `None` when no paragraph is left from the source.
+    fn splice(&self) -> Option<S13SplicedPart> {
+        let mut opened = HashMap::new();
+        each_paragraph(&self.opened, &mut |paragraph| {
+            if let Some(ordinal) = paragraph.source_ordinal {
+                opened.insert(ordinal, paragraph);
+            }
+        });
+        let (mut paragraphs, mut changed, mut inserted) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut previous, mut waiting) = (None, 0usize);
+        each_paragraph(&self.body.content, &mut |paragraph| match paragraph.source_ordinal {
+            Some(ordinal) => {
+                paragraphs.push(ordinal);
+                if !opened.remove(&ordinal).is_some_and(|was| Arc::ptr_eq(was, paragraph) || was == paragraph) {
+                    changed.push(ordinal);
+                }
+                inserted.extend(std::iter::repeat_n(S13SpliceAnchor::Before(ordinal), waiting));
+                waiting = 0;
+                previous = Some(ordinal);
+            }
+            None => match previous {
+                Some(ordinal) => inserted.push(S13SpliceAnchor::After(ordinal)),
+                None => waiting += 1,
+            },
+        });
+        if paragraphs.is_empty() {
+            return None;
+        }
+        let mut removed: Vec<u32> = opened.into_keys().collect();
+        removed.sort_unstable();
+        Some(S13SplicedPart {
+            part: self.part.clone(),
+            sha256: self.part_sha256.clone(),
+            paragraphs,
+            changed,
+            inserted,
+            removed,
+            paragraph_patches: Vec::new(),
+            legacy_paragraphs: Vec::new(),
+            table_patches: Vec::new(),
+            format_only: Vec::new(),
+        })
+    }
+}
+
+// ---- The retained layout ----
+
+/// The engine's laid-out session of the document, kept in step with the model edit by edit.
+struct View {
+    /// The layout request's package fields; edits leave them as opened.
+    package: Value,
+    /// `None` until first drawn, and after an edit the session could not take: the next draw opens the save.
+    words: Option<Words>,
+    /// Edits were mirrored into `words` since it was last laid out.
+    pending: bool,
+    /// Sessions opened (each a whole layout) and pages drawn.
+    #[cfg(test)]
+    opens: u32,
+    #[cfg(test)]
+    draws: u32,
+}
+
+/// How an edit reaches the engine's session.
+// Limit: paragraph splits, joins, inserts and deletes, style changes, page breaks, tabs and replacements across
+// paragraphs lay the document out again from its save; mirroring them through the engine's paragraph ops (with
+// the paragraph properties the model gives the new halves) lifts it.
+enum Mirror {
+    /// Plain text over a range of one paragraph.
+    Text { range: DocRange, text: String },
+    /// Run formatting over a range: each touched property is written as the model now resolves it.
+    Format { range: DocRange, touched: Touched },
+    Align { index: u32 },
+    Reopen,
+}
+
+impl View {
+    fn mirror(&mut self, op: &Mirror, before: &[BlockContent], after: &[BlockContent], book: &StyleBook) {
+        let Some(words) = &self.words else { return };
+        if mirror_into(words.engine().doc(), op, before, after, book).is_some() {
+            self.pending = true;
+        } else {
+            self.words = None;
+        }
+    }
+}
+
+/// Applies `op` to the session, `before` and `after` being the body around the model's edit. `None` when the
+/// session's paragraphs do not read as the model's or the engine refuses: the session no longer matches.
+fn mirror_into(
+    doc: &EditingDoc,
+    op: &Mirror,
+    before: &[BlockContent],
+    after: &[BlockContent],
+    book: &StyleBook,
+) -> Option<()> {
+    let range = match op {
+        Mirror::Text { range, .. } | Mirror::Format { range, .. } => {
+            let (start, end) = ordered(*range);
+            start.paragraph..=end.paragraph
+        }
+        Mirror::Align { index } => *index..=*index,
+        Mirror::Reopen => return None,
+    };
+    let slots = slots(doc, before)?;
+    for index in range {
+        if shown(nth_paragraph(before, index)?) != slots.get(index as usize)?.shown {
+            return None;
+        }
+    }
+    let ctx = EditCtx::local("", "");
+    match op {
+        Mirror::Text { range, text } => {
+            let (start, end) = ordered(*range);
+            if start.paragraph != end.paragraph || text.chars().any(|c| c.is_control() || c == '\u{fffc}') {
+                return None;
+            }
+            let slot = &slots[start.paragraph as usize];
+            let (from, to) = (slot.start + start.offset, slot.start + end.offset);
+            let story = slot.story.as_str();
+            match (from == to, text.is_empty()) {
+                (true, true) => {}
+                (true, false) => {
+                    doc.insert_text(&ctx, Position::new(story, from), text, FormatPolicy::Inherit).ok()?;
+                }
+                (false, true) => {
+                    doc.delete_range(&ctx, StoryRange::new(story, from, to)).ok()?;
+                }
+                (false, false) => {
+                    doc.replace_range(&ctx, StoryRange::new(story, from, to), text).ok()?;
+                }
+            }
+            let now = units(doc, story)?.into_iter().find_map(|unit| match unit {
+                Unit::Paragraph(now) if now.key == slot.key => Some(now.shown),
+                _ => None,
+            })?;
+            (now == shown(nth_paragraph(after, start.paragraph)?)).then_some(())
+        }
+        Mirror::Format { range, touched } => {
+            let (start, end) = ordered(*range);
+            for index in start.paragraph..=end.paragraph {
+                let slot = &slots[index as usize];
+                let paragraph = nth_paragraph(after, index)?;
+                let from = if index == start.paragraph { start.offset } else { 0 };
+                let to = if index == end.paragraph { end.offset } else { u32::MAX };
+                let chain = book.chain(book.paragraph_style(paragraph).map(|s| s.style_id.as_str()));
+                let mut pos = 0u32;
+                for item in &paragraph.content {
+                    let len = item_len(item) as u32;
+                    if let ParagraphContent::Inline(InlineNode::Run(run)) = item
+                        && len > 0
+                        && pos >= from
+                        && pos + len <= to
+                    {
+                        let delta = touched.delta(&look_of(book, &chain, run))?;
+                        let at = StoryRange::new(slot.story.as_str(), slot.start + pos, slot.start + pos + len);
+                        let (_, kept) = doc.format_range_keeping(&ctx, at, &delta).ok()?;
+                        if !kept.is_empty() {
+                            return None;
+                        }
+                    }
+                    pos += len;
+                }
+            }
+            Some(())
+        }
+        Mirror::Align { index } => {
+            let alignment = nth_paragraph(after, *index)?.formatting.as_ref()?.alignment.clone()?;
+            let delta = ParaAttrDelta { alignment: Change::Set(alignment), ..Default::default() };
+            let key = slots[*index as usize].key.clone();
+            doc.set_paragraph_attrs(&ctx, &ParaSelector::One(key), &delta).ok().map(drop)
+        }
+        Mirror::Reopen => None,
+    }
+}
+
+/// The run properties a format edit touched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Touched {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+    size: bool,
+    color: bool,
+    font: bool,
+}
+
+impl Touched {
+    /// The session's run attributes hold resolved formatting, so each touched property is written as `look`
+    /// resolves it. `None` for a look the delta can't carry (theme colours and fonts).
+    fn delta(self, look: &Look) -> Option<InlineFormatDelta> {
+        let flag = |on: Option<bool>| if on == Some(true) { Change::Set(true) } else { Change::Clear };
+        let mut delta = InlineFormatDelta::default();
+        if self.bold {
+            delta.bold = flag(look.bold);
+        }
+        if self.italic {
+            delta.italic = flag(look.italic);
+        }
+        if self.underline {
+            delta.underline = match &look.underline_style {
+                Some(style) if style != "none" => {
+                    Change::Set(UnderlinePatch { style: Some(style.clone()), color: None })
+                }
+                _ => Change::Clear,
+            };
+        }
+        if self.strike {
+            delta.strike = if look.strike == Some(true) { Change::Set(StrikePatch { double: false }) } else { Change::Clear };
+        }
+        if self.size {
+            delta.font_size = look.half_points.map_or(Change::Clear, |half| Change::Set(half / 2.0));
+        }
+        if self.color {
+            delta.color = match &look.paint {
+                Some(paint) if paint.theme_color.is_some() => return None,
+                Some(ColorValue { rgb: Some(rgb), .. }) if !rgb.eq_ignore_ascii_case("auto") => {
+                    Change::Set(ColorPatch::Rgb(rgb.clone()))
+                }
+                _ => Change::Clear,
+            };
+        }
+        if self.font {
+            delta.font_family = Change::Set(FontFamilyPatch { ascii: look.font.clone()?, h_ansi: None });
+        }
+        Some(delta)
+    }
+}
+
+/// A model paragraph's place in the session: its story, paragraph key and first unit, and its text as
+/// [`shown`] reads it.
+struct Slot {
+    story: String,
+    key: String,
+    start: u32,
+    shown: String,
+}
+
+/// One block of a session story.
+enum Unit {
+    Paragraph(Slot),
+    /// The story of each cell, row by row.
+    Table(Vec<Vec<String>>),
+    Control(String),
+}
+
+/// A tab, break, hyphen or object, which the session may hold as an embed or as a character.
+fn object_or(c: char) -> char {
+    if matches!(c, '\t' | '\n' | '\u{b}' | '\u{c}' | '\u{2011}' | '\u{ad}') { '\u{fffc}' } else { c }
+}
+
+/// `paragraph`'s text with every tab, break, hyphen and object read as one object character.
+fn shown(paragraph: &Paragraph) -> String {
+    let mut runs = Vec::new();
+    for item in &paragraph.content {
+        item_runs(item, &mut runs);
+    }
+    runs.iter().flat_map(|run| run.content.iter()).flat_map(|piece| piece_text(piece).chars()).map(object_or).collect()
+}
+
+fn units(doc: &EditingDoc, story: &str) -> Option<Vec<Unit>> {
+    let mut out = Vec::new();
+    let (mut pos, mut start, mut shown) = (0u32, 0u32, String::new());
+    for segment in doc.story_segments(story).ok()? {
+        match segment.content {
+            SegmentContent::Text(text) => {
+                pos += utf16_len(&text) as u32;
+                shown.extend(text.chars().map(object_or));
+            }
+            SegmentContent::Pilcrow(mark) => {
+                let slot = Slot { story: story.to_owned(), key: mark.para_id, start, shown: std::mem::take(&mut shown) };
+                out.push(Unit::Paragraph(slot));
+                pos += 1;
+                start = pos;
+            }
+            SegmentContent::OtherEmbed { kind, payload } if kind == "table" || kind == "blockSdt" => {
+                if !shown.is_empty() {
+                    return None;
+                }
+                out.push(if kind == "table" {
+                    let rows = serde_json::to_value(payload.get("rows")?).ok()?;
+                    let stories = |row: &Value| -> Option<Vec<String>> {
+                        row["cells"].as_array()?.iter().map(|cell| cell["story"].as_str().map(str::to_owned)).collect()
+                    };
+                    Unit::Table(rows.as_array()?.iter().map(stories).collect::<Option<_>>()?)
+                } else {
+                    Unit::Control(serde_json::to_value(payload.get("story")?).ok()?.as_str()?.to_owned())
+                });
+                pos += 1;
+                start = pos;
+            }
+            SegmentContent::OtherEmbed { .. } => {
+                pos += 1;
+                shown.push('\u{fffc}');
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Every model paragraph's place in the session, in model order; `None` when the session's structure differs.
+fn slots(doc: &EditingDoc, blocks: &[BlockContent]) -> Option<Vec<Slot>> {
+    let mut out = Vec::new();
+    story_slots(doc, "body", blocks, &mut out)?;
+    Some(out)
+}
+
+fn story_slots(doc: &EditingDoc, story: &str, blocks: &[BlockContent], out: &mut Vec<Slot>) -> Option<()> {
+    let mut units = units(doc, story)?.into_iter();
+    for block in blocks {
+        match block {
+            BlockContent::RawXml(_) => {}
+            BlockContent::Paragraph(_) => {
+                let Unit::Paragraph(slot) = units.next()? else { return None };
+                out.push(slot);
+            }
+            BlockContent::Table(table) => {
+                let Unit::Table(rows) = units.next()? else { return None };
+                if rows.len() != table.rows.len() {
+                    return None;
+                }
+                for (row, stories) in table.rows.iter().zip(&rows) {
+                    if stories.len() != row.cells.len() {
+                        return None;
+                    }
+                    for (cell, story) in row.cells.iter().zip(stories) {
+                        story_slots(doc, story, &cell.content, out)?;
+                    }
+                }
+            }
+            BlockContent::BlockSdt(sdt) => {
+                let Unit::Control(story) = units.next()? else { return None };
+                story_slots(doc, &story, &sdt.content, out)?;
+            }
+        }
+    }
+    // What is left can only be the paragraph the session closes a story with after a table or control.
+    match (units.next(), units.next()) {
+        (None, _) | (Some(Unit::Paragraph(_)), None) => Some(()),
+        _ => None,
     }
 }
 
@@ -546,7 +1009,7 @@ fn paragraph_mut<'a>(content: &'a mut Vec<BlockContent>, at: &Spot) -> Result<&'
     }
 }
 
-fn each_paragraph<'a>(blocks: &'a [BlockContent], visit: &mut impl FnMut(&'a Paragraph)) {
+fn each_paragraph<'a>(blocks: &'a [BlockContent], visit: &mut impl FnMut(&'a Arc<Paragraph>)) {
     for block in blocks {
         match block {
             BlockContent::Paragraph(paragraph) => visit(paragraph),
@@ -561,6 +1024,17 @@ fn each_paragraph<'a>(blocks: &'a [BlockContent], visit: &mut impl FnMut(&'a Par
             BlockContent::RawXml(_) => {}
         }
     }
+}
+
+fn nth_paragraph(blocks: &[BlockContent], index: u32) -> Option<&Paragraph> {
+    let (mut found, mut seen) = (None, 0u32);
+    each_paragraph(blocks, &mut |paragraph| {
+        if seen == index {
+            found = Some(paragraph);
+        }
+        seen += 1;
+    });
+    found.map(|paragraph| &**paragraph)
 }
 
 // ---- A paragraph's text ----
@@ -698,9 +1172,11 @@ struct Look {
     bold: Option<bool>,
     italic: Option<bool>,
     underline: Option<bool>,
+    underline_style: Option<String>,
     strike: Option<bool>,
     half_points: Option<f64>,
     color: Option<String>,
+    paint: Option<ColorValue>,
     font: Option<String>,
 }
 
@@ -715,6 +1191,7 @@ impl Look {
         }
         if let Some(underline) = &f.underline {
             self.underline = Some(underline.style != "none");
+            self.underline_style = Some(underline.style.clone());
         }
         if f.strike.is_some() {
             self.strike = f.strike;
@@ -725,6 +1202,7 @@ impl Look {
         // Limit: theme colours read as None; resolving them against the theme part lifts it.
         if let Some(color) = &f.color {
             self.color = color.rgb.clone().filter(|rgb| !rgb.eq_ignore_ascii_case("auto"));
+            self.paint = Some(color.clone());
         }
         if let Some(name) = f.font_family.as_ref().and_then(|family| family.ascii.clone().or_else(|| family.h_ansi.clone())) {
             self.font = Some(name);
@@ -732,7 +1210,8 @@ impl Look {
     }
 }
 
-fn read_run(book: &StyleBook, paragraph_chain: &[&Style], run: &Run, text: String, editable: bool) -> DocRun {
+/// `run`'s look: document defaults, then the paragraph style chain, the character style chain and its own.
+fn look_of(book: &StyleBook, paragraph_chain: &[&Style], run: &Run) -> Look {
     let mut look = Look::default();
     look.over(book.defaults.and_then(|defaults| defaults.r_pr.as_ref()));
     for style in paragraph_chain {
@@ -742,6 +1221,11 @@ fn read_run(book: &StyleBook, paragraph_chain: &[&Style], run: &Run, text: Strin
         look.over(style.r_pr.as_ref());
     }
     look.over(run.formatting.as_ref());
+    look
+}
+
+fn read_run(book: &StyleBook, paragraph_chain: &[&Style], run: &Run, text: String, editable: bool) -> DocRun {
+    let look = look_of(book, paragraph_chain, run);
     DocRun {
         text,
         bold: look.bold.unwrap_or(false),
@@ -1222,6 +1706,7 @@ struct Patch {
     half_points: Option<f64>,
     color: Option<ColorValue>,
     font: Option<String>,
+    clear: Touched,
 }
 
 impl Patch {
@@ -1248,6 +1733,22 @@ impl Patch {
             Some(font) if font.trim().is_empty() => return Err(refuse("A font needs a name.")),
             font => font.map(|f| f.trim().to_owned()),
         };
+        let mut clear = Touched::default();
+        for property in format.clear {
+            let (cleared, set) = match property {
+                DocRunProperty::Bold => (&mut clear.bold, format.bold.is_some()),
+                DocRunProperty::Italic => (&mut clear.italic, format.italic.is_some()),
+                DocRunProperty::Underline => (&mut clear.underline, format.underline.is_some()),
+                DocRunProperty::Strike => (&mut clear.strike, format.strike.is_some()),
+                DocRunProperty::Size => (&mut clear.size, half_points.is_some()),
+                DocRunProperty::Color => (&mut clear.color, color.is_some()),
+                DocRunProperty::Font => (&mut clear.font, font.is_some()),
+            };
+            if set {
+                return Err(refuse("A property can't be set and cleared at once."));
+            }
+            *cleared = true;
+        }
         Ok(Self {
             bold: format.bold,
             italic: format.italic,
@@ -1256,7 +1757,21 @@ impl Patch {
             half_points,
             color,
             font,
+            clear,
         })
+    }
+
+    fn touched(&self) -> Touched {
+        let clear = self.clear;
+        Touched {
+            bold: clear.bold || self.bold.is_some(),
+            italic: clear.italic || self.italic.is_some(),
+            underline: clear.underline || self.underline.is_some(),
+            strike: clear.strike || self.strike.is_some(),
+            size: clear.size || self.half_points.is_some(),
+            color: clear.color || self.color.is_some(),
+            font: clear.font || self.font.is_some(),
+        }
     }
 
     fn apply(&self, formatting: &mut Option<TextFormatting>) {
@@ -1295,6 +1810,32 @@ impl Patch {
             family.ascii_theme = None;
             family.h_ansi_theme = None;
             family.cs_theme = None;
+        }
+        // Cleared properties drop their direct value, so the styles' value shows through.
+        let clear = self.clear;
+        if clear.bold {
+            (f.bold, f.bold_cs) = (None, None);
+        }
+        if clear.italic {
+            (f.italic, f.italic_cs) = (None, None);
+        }
+        if clear.underline {
+            f.underline = None;
+        }
+        if clear.strike {
+            (f.strike, f.double_strike) = (None, None);
+        }
+        if clear.size {
+            (f.font_size, f.font_size_cs) = (None, None);
+        }
+        if clear.color {
+            f.color = None;
+        }
+        if clear.font {
+            f.font_family = None;
+        }
+        if *f == TextFormatting::default() {
+            *formatting = None;
         }
     }
 }
@@ -1540,5 +2081,189 @@ mod tests {
         assert!(doc.set_run_format(span(0, 0, 3), red).is_err());
         // A failed edit leaves nothing to undo.
         assert!(!doc.can_undo().unwrap());
+    }
+
+    impl DocEditor {
+        fn engine_stats(&self) -> docx_edit::EngineStats {
+            self.ask(|editor| Ok(editor.words()?.engine().stats())).unwrap()
+        }
+
+        /// Sessions opened (each a whole layout) and pages drawn so far.
+        fn layouts(&self) -> (u32, u32) {
+            self.ask(|editor| Ok((editor.view.opens, editor.view.draws))).unwrap()
+        }
+    }
+
+    const STYLES: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        r#"<w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+        r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>"#,
+        r#"<w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style></w:styles>"#,
+    );
+
+    /// A .docx whose body holds `body`, written here so every byte of it is known.
+    fn package(body: &str) -> Vec<u8> {
+        use std::io::Write;
+        let document = format!(
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{}"#,
+                r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" "#,
+                r#"w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr></w:body></w:document>"#,
+            ),
+            body
+        );
+        let files = [
+            (
+                "[Content_Types].xml",
+                concat!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                    r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+                    r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
+                    r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+                    r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#,
+                    r#"<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#,
+                    r#"</Types>"#,
+                )
+                .to_owned(),
+            ),
+            (
+                "_rels/.rels",
+                concat!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+                    r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>"#,
+                    r#"</Relationships>"#,
+                )
+                .to_owned(),
+            ),
+            (
+                "word/_rels/document.xml.rels",
+                concat!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+                    r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#,
+                    r#"</Relationships>"#,
+                )
+                .to_owned(),
+            ),
+            ("word/styles.xml", STYLES.to_owned()),
+            ("word/document.xml", document),
+        ];
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, xml) in files {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// Markup the model does not carry: revision IDs on the paragraph and an element of a foreign namespace.
+    const UNTOUCHED: &str = concat!(
+        r#"<w:p w:rsidR="00AB12CD" w:rsidRDefault="00AB12CD"><w:r><w:t>Keep this paragraph as it is.</w:t></w:r>"#,
+        r#"<pc:mystery xmlns:pc="urn:papercraft:test" pc:v="1"/></w:p>"#,
+    );
+
+    /// 25 pages of four short paragraphs, each page after the first opened by a page break. Paragraph `4 * page +
+    /// line` reads "Page {page} line {line} …"; paragraph 13 is [`UNTOUCHED`].
+    fn long_document() -> Vec<u8> {
+        let mut body = String::new();
+        for page in 0..25 {
+            for line in 0..4 {
+                if page == 3 && line == 1 {
+                    body.push_str(UNTOUCHED);
+                    continue;
+                }
+                body.push_str("<w:p>");
+                if page > 0 && line == 0 {
+                    body.push_str(r#"<w:r><w:br w:type="page"/></w:r>"#);
+                }
+                body.push_str(&format!("<w:r><w:t>Page {page} line {line} of the long document.</w:t></w:r></w:p>"));
+            }
+        }
+        package(&body)
+    }
+
+    #[test]
+    fn page_count_is_exact_without_drawing() {
+        let doc = open(&long_document());
+        assert_eq!(doc.page_count().unwrap(), 25);
+        assert_eq!(doc.layouts(), (1, 0));
+        assert!(doc.render_page(25, 0.25).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_edit_lays_out_only_what_it_changed() {
+        let doc = open(&long_document());
+        let count = doc.paragraph_count().unwrap();
+        assert!(doc.render_page(20, 0.25).unwrap().is_some());
+        let before = doc.engine_stats();
+
+        assert!(text(&doc, 82).starts_with("Page 20 line 2"));
+        doc.replace_text(span(82, 8, 12), "LINE".into()).unwrap();
+        assert!(doc.render_page(20, 0.25).unwrap().is_some());
+        let after = doc.engine_stats();
+        eprintln!("before {before:?}\nafter {after:?}");
+
+        // One session for the whole run: the edit went into it instead of a new layout of the document.
+        assert_eq!(doc.layouts(), (1, 2));
+        assert_ne!(after.layout_epoch, before.layout_epoch);
+        let measured = (after.resident_measure_calls + after.compatibility_measure_calls)
+            - (before.resident_measure_calls + before.compatibility_measure_calls);
+        assert!(measured <= 3, "{measured} of {count} paragraphs measured again");
+        assert_eq!(doc.page_count().unwrap(), 25);
+
+        // Formatting and alignment go into the same session.
+        doc.set_run_format(span(82, 0, 4), bold()).unwrap();
+        doc.set_alignment(82, DocAlign::Center).unwrap();
+        assert!(doc.render_page(20, 0.25).unwrap().is_some());
+        assert_eq!(doc.layouts(), (1, 3));
+
+        // A split is laid out again from the save.
+        doc.split_paragraph(at(82, 4)).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 25);
+        assert_eq!(doc.layouts(), (2, 3));
+    }
+
+    #[test]
+    fn an_edited_save_keeps_untouched_paragraphs_byte_for_byte() {
+        let doc = open(&long_document());
+        assert_eq!(text(&doc, 13), "Keep this paragraph as it is.");
+        doc.replace_text(span(82, 8, 12), "LINE".into()).unwrap();
+        doc.split_paragraph(at(90, 4)).unwrap();
+        let saved = doc.save().unwrap();
+        let xml = String::from_utf8(parts(&saved)["word/document.xml"].clone()).unwrap();
+        assert!(xml.contains(UNTOUCHED), "{xml}");
+        assert!(xml.contains("Page 20 LINE 2 of the long document."));
+        assert!(!xml.contains("Page 20 line 2"));
+        let again = open(&saved);
+        assert_eq!(again.paragraph_count().unwrap(), 101);
+        assert_eq!(text(&again, 90), "Page");
+        assert_eq!(text(&again, 91), " 22 line 2 of the long document.");
+    }
+
+    #[test]
+    fn clearing_bold_restores_the_style_value() {
+        let doc = open(&package(concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:b w:val="0"/></w:rPr><w:t>Heading</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Body</w:t></w:r></w:p>"#,
+        )));
+        assert!(!doc.paragraph(0).unwrap().runs[0].bold);
+        assert!(doc.paragraph(1).unwrap().runs[0].bold);
+
+        let clear = DocRunFormat { clear: vec![DocRunProperty::Bold], ..Default::default() };
+        doc.set_run_format(DocRange { start: at(0, 0), end: at(1, 4) }, clear).unwrap();
+        assert!(doc.paragraph(0).unwrap().runs[0].bold);
+        assert!(!doc.paragraph(1).unwrap().runs[0].bold);
+        assert_eq!(doc.paragraph(1).unwrap().runs[0].size_pt, Some(11.0));
+
+        let again = open(&doc.save().unwrap());
+        assert!(again.paragraph(0).unwrap().runs[0].bold);
+        assert!(!again.paragraph(1).unwrap().runs[0].bold);
+
+        let both = DocRunFormat { bold: Some(true), clear: vec![DocRunProperty::Bold], ..Default::default() };
+        assert!(doc.set_run_format(span(0, 0, 3), both).is_err());
     }
 }

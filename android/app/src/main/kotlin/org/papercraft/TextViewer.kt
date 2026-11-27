@@ -1,13 +1,16 @@
 package org.papercraft
 
 import android.content.Context
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -33,13 +36,16 @@ fun Context.loadText(file: DocFile): List<String> {
     return lines.flatMap { it.chunked(4000).ifEmpty { listOf("") } }
 }
 
-/** [monospace] keeps space-aligned columns (print files) lined up. */
+/** [monospace] keeps space-aligned columns (print files) lined up: lines don't wrap and the text scrolls sideways as one block. [find]'s matches are highlighted and scrolled to. */
 @Composable
-fun TextViewer(lines: List<String>, monospace: Boolean = false) {
+fun TextViewer(lines: List<String>, find: FindState, monospace: Boolean = false) {
     val style = MaterialTheme.typography.bodyLarge.let { if (monospace) it.copy(fontFamily = FontFamily.Monospace) else it }
+    val sideways = if (monospace) Modifier.fillMaxHeight().horizontalScroll(rememberScrollState()) else Modifier.fillMaxSize()
+    val list = rememberLazyListState()
+    val found = rememberTextFind(find, lines, list)
     SelectionContainer {
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp)) {
-            items(lines) { Text(it, style = style) }
+        LazyColumn(sideways, state = list, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp)) {
+            itemsIndexed(lines) { i, line -> FoundLine(found, i, line, style, softWrap = !monospace) }
         }
     }
 }

@@ -48,8 +48,8 @@ enum class Viewer(val exts: Set<String>, val nouns: List<String>, val fullScreen
     Pdf(setOf("pdf"), listOf("PDF"), fullScreen = true),
     Image(setOf("jpg", "jpeg", "png", "bmp"), listOf("picture"), fullScreen = true),
     Tiff(setOf("tif", "tiff"), listOf("picture"), fullScreen = true),
-    Table(setOf("csv", "dbf", "dif"), listOf("CSV file")),
-    Text(setOf("txt", "rtf", "xml", "prn"), listOf("text file")),
+    Table(setOf("csv", "dbf", "dif"), listOf("CSV file", "dBASE table", "DIF file")),
+    Text(setOf("txt", "rtf", "xml", "prn"), listOf("text file", "RTF document", "XML file", "print file")),
     Web(setOf("html", "htm"), listOf("web page")),
     WebArchive(setOf("mht", "mhtml"), listOf("saved web page")),
 }
@@ -60,6 +60,21 @@ val openableHint: String = Viewer.entries.flatMap { it.nouns }.distinct().let { 
 fun categoryOf(ext: String): Category? = Category.entries.firstOrNull { ext in it.exts }
 
 fun viewerOf(ext: String): Viewer? = Viewer.entries.firstOrNull { ext in it.exts }
+
+private val typeNouns = mapOf(
+    "txt" to "Text file", "rtf" to "RTF document", "xml" to "XML file", "prn" to "Print file",
+    "csv" to "CSV file", "dbf" to "dBASE table", "dif" to "DIF file", "pdf" to "PDF",
+)
+
+/** What a recent-file row calls [ext]'s type, e.g. "RTF document", "Spreadsheet", "ZIP file". */
+fun typeLabel(ext: String): String = typeNouns[ext] ?: when (categoryOf(ext)) {
+    Category.Docs -> "Document"
+    Category.Sheets -> "Spreadsheet"
+    Category.Slides -> "Presentation"
+    Category.Pdf -> "PDF"
+    Category.Images -> "Picture"
+    null -> if (ext.isEmpty()) "File" else "${ext.uppercase()} file"
+}
 
 /** Colored tile with the extension, like WPS/Office file icons. Decorative: the row text already says the type. */
 @Composable

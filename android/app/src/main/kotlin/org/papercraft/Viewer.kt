@@ -81,15 +81,19 @@ import java.io.FileNotFoundException
 fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
     val context = LocalContext.current
     val viewer = viewerOf(file.ext)
+    val editor = editorOf(file.ext)
+    var editing by rememberSaveable { mutableStateOf(false) }
+    if (editing && editor != null) return editor.screen(file, false) { editing = false }
     var status by remember { mutableStateOf<String?>(null) }
     var chrome by rememberSaveable { mutableStateOf(true) }
+    val find = remember { FindState() }
     val scope = rememberCoroutineScope()
     val saveThumb: (Bitmap) -> Unit = { bmp -> scope.launch(Dispatchers.IO) { runCatching { Thumbnails.save(context, file.uri, bmp) } } }
     BackHandler(onBack = onBack)
 
     if (viewer?.fullScreen == true) {
         // The bars float over the content, so hiding them never moves it.
-        SystemBarsVisible(chrome)
+        SystemBarsVisible(chrome || find.open)
         val hideOnScroll = remember {
             object : NestedScrollConnection {
                 override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
@@ -113,32 +117,40 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                     LaunchedEffect(it) { saveThumb(it.asAndroidBitmap()) }
                     ImageViewer(it, file.name, toggle)
                 }
-                Viewer.Office -> Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
-                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
+                Viewer.Office -> if (categoryOf(file.ext) == Category.Sheets) {
+                    Loaded(file, { SheetGridBook.open(this, file) }, release = SheetGridBook::close) { SheetGrid(it, barSpace, chrome || find.open, toggle, saveThumb, find) }
+                } else Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
+                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb, find)
                 }
-                Viewer.Pdf -> Loaded<Pages>(file, { PdfDoc.open(this, file.uri) }, release = Pages::closeLater) {
-                    PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb)
+                Viewer.Pdf -> PdfUnlock(file) { password, attempt, locked ->
+                    Loaded<Pages>(file, { PdfDoc.open(this, file.uri, password) }, release = Pages::closeLater, key = attempt, locked = locked) {
+                        PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb, find)
+                    }
                 }
                 else -> error("not a full-screen viewer")
             }
             AnimatedVisibility(
-                chrome,
+                chrome || find.open,
                 enter = slideInVertically(tween(220)) { -it } + fadeIn(tween(180)),
                 exit = slideOutVertically(tween(200)) { -it } + fadeOut(tween(150)),
             ) {
-                ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility)
+                if (find.open) FindBar(find, WindowInsets.statusBarsIgnoringVisibility)
+                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if (viewer == Viewer.Office || viewer == Viewer.Pdf) find::show else null, onEdit = editor?.let { { editing = true } })
             }
         }
     } else {
         val scroll = TopAppBarDefaults.enterAlwaysScrollBehavior()
         Scaffold(
             modifier = Modifier.nestedScroll(scroll.nestedScrollConnection).semantics { paneTitle = file.name },
-            topBar = { ViewerTopBar(file, status, onBack, scroll, TopAppBarDefaults.windowInsets) },
+            topBar = {
+                if (find.open) FindBar(find, TopAppBarDefaults.windowInsets)
+                else ViewerTopBar(file, status, onBack, scroll, TopAppBarDefaults.windowInsets, onFind = if (viewer == Viewer.Text || viewer == Viewer.Table) find::show else null)
+            },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).clipToBounds()) {
                 when (viewer) {
-                    Viewer.Text -> Loaded(file, { loadText(file) }) { TextViewer(it, monospace = file.ext == "prn") }
-                    Viewer.Table -> Loaded(file, { loadTable(file) }) { TableViewer(it) }
+                    Viewer.Text -> Loaded(file, { loadText(file) }) { TextViewer(it, find, monospace = file.ext == "prn") }
+                    Viewer.Table -> Loaded(file, { loadTable(file) }) { TableViewer(it, find) }
                     Viewer.Web -> Loaded(file, { loadWebPage(file) }) { WebViewer(it) }
                     Viewer.WebArchive -> Loaded(file, { loadWebArchive(file) }) { WebViewer(it) }
                     null -> CantOpen(
@@ -167,7 +179,7 @@ private fun SystemBarsVisible(visible: Boolean) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets) {
+private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets, onFind: (() -> Unit)?, onEdit: (() -> Unit)? = null) {
     val context = LocalContext.current
     var menu by remember { mutableStateOf(false) }
     TopAppBar(
@@ -182,6 +194,8 @@ private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scr
         },
         navigationIcon = { IconButton(onBack) { Icon(painterResource(R.drawable.ic_back), "Back") } },
         actions = {
+            onFind?.let { IconButton(it) { Icon(painterResource(R.drawable.ic_search), "Find in file") } }
+            onEdit?.let { IconButton(it) { Icon(painterResource(R.drawable.ic_edit), "Edit") } }
             IconButton({ share(context, file.uri) }) { Icon(painterResource(R.drawable.ic_share), "Share") }
             Box {
                 IconButton({ menu = true }) { Icon(painterResource(R.drawable.ic_more), "More options") }
@@ -216,20 +230,26 @@ private fun openElsewhere(context: Context, uri: Uri) {
     runCatching { context.startActivity(chooser) }
 }
 
-/** [release] closes what [load] returned; loading finishes even if the user leaves, so nothing opened is lost. */
+/**
+ * [release] closes what [load] returned; loading finishes even if the user leaves, so nothing opened is lost.
+ * A new [key] loads again; [locked] shows instead of the error when the file needs a password.
+ */
 @Composable
-private fun <T : Any> Loaded(file: DocFile, load: Context.() -> T, release: (T) -> Unit = {}, content: @Composable (T) -> Unit) {
+private fun <T : Any> Loaded(
+    file: DocFile, load: Context.() -> T, release: (T) -> Unit = {}, key: Any? = null,
+    locked: (@Composable (PasswordProtectedException) -> Unit)? = null, content: @Composable (T) -> Unit,
+) {
     val context = LocalContext.current
-    val result by produceState<Result<T>?>(null, file.uri) {
+    val result by produceState<Result<T>?>(null, file.uri, key) {
         val loaded = withContext(NonCancellable + Dispatchers.IO) { runCatching { context.load() } }
         value = loaded
         awaitDispose { loaded.getOrNull()?.let(release) }
     }
     val r = result ?: return Spinner()
-    content(r.getOrElse { return CantOpen(file, friendlyError(it)) })
+    content(r.getOrElse { e -> return if (e is PasswordProtectedException && locked != null) locked(e) else CantOpen(file, friendlyError(e)) })
 }
 
-private fun friendlyError(t: Throwable): String = when (t) {
+internal fun friendlyError(t: Throwable): String = when (t) {
     is FileNotFoundException, is SecurityException ->
         "Papercraft can't reach this file anymore. It may have been moved or deleted."
     is TooBigException, is OutOfMemoryError -> "This file is too big to open for now."
@@ -242,7 +262,7 @@ private fun Spinner() = Box(Modifier.fillMaxSize(), Alignment.Center) {
 }
 
 @Composable
-private fun CantOpen(file: DocFile, reason: String) {
+internal fun CantOpen(file: DocFile, reason: String) {
     val context = LocalContext.current
     Column(
         Modifier.fillMaxSize().padding(32.dp).semantics { liveRegion = LiveRegionMode.Polite },

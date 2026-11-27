@@ -4,17 +4,17 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.papercraft.core.CoreException
 import org.papercraft.core.PdfFile
-import org.papercraft.core.PdfHit
 import org.papercraft.core.PdfPageSize
 import java.io.FileNotFoundException
 import java.nio.ByteBuffer
 
 /** The PDF is locked: ask for its password and call [PdfDoc.open] again. [wrongPassword] is true when the one given didn't fit. */
 class PasswordProtectedException(val wrongPassword: Boolean) :
-    Exception(if (wrongPassword) "That password doesn't open this PDF." else "This PDF is password-protected. Password support is coming later.")
+    Exception(if (wrongPassword) "That password doesn't open this PDF." else "This PDF is password-protected.")
 
 /** A PDF drawn by PDFium in the Rust core, the same on every Android version. The core runs one PDFium call at a time. */
 class PdfDoc private constructor(private val file: PdfFile) : Pages {
@@ -32,8 +32,19 @@ class PdfDoc private constructor(private val file: PdfFile) : Pages {
     /** Page [index]'s text, or null past the last page. */
     suspend fun pageText(index: Int): String? = withContext(Dispatchers.IO) { file.pageText(index.toUInt()) }
 
-    /** Every case-insensitive match of [query]; boxes are in points from the page's top-left corner, like [pageSize]. */
-    suspend fun search(query: String): List<PdfHit> = withContext(Dispatchers.IO) { file.search(query) }
+    /** Boxes over each case-insensitive match of [query], page by page; stops between pages once cancelled. */
+    override suspend fun find(query: String, limit: Int): List<PageHit> = withContext(Dispatchers.IO) {
+        val hits = ArrayList<PageHit>()
+        for (index in 0 until pageCount) {
+            ensureActive()
+            val size = file.pageSize(index.toUInt()) ?: break
+            for (hit in file.searchPage(index.toUInt(), query)) {
+                hits += PageHit(index, hit.boxes.map { PageBox.fromPoints(it.left, it.top, it.right, it.bottom, size.width, size.height) })
+                if (hits.size >= limit) return@withContext hits
+            }
+        }
+        hits
+    }
 
     override fun closeLater() = file.close()
 

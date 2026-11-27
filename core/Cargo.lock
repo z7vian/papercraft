@@ -1510,6 +1510,7 @@ dependencies = [
  "pdfium-render",
  "quick-xml 0.41.0",
  "serde_json",
+ "sha2",
  "uniffi",
  "zip",
 ]
