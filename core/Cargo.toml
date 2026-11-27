@@ -1,0 +1,29 @@
+[package]
+name = "papercraft-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+name = "papercraft_core"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"] # only the bindings generator needs this; keeps the Android build lean
+
+[dependencies]
+uniffi = "0.33"
+encoding_rs = "0.8"
+chardetng = "1"
+csv = "1.4.0"
+mail-parser = "1.0.2"
+image = { version = "0.25.10", default-features = false, features = ["tiff"] }
+
+[profile.release]
+lto = true
+strip = "debuginfo" # full strip would delete the UniFFI metadata the bindings generator reads

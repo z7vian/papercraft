@@ -1,0 +1,6 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- A sheet of paper with a folded corner and three text lines. -->
+    <path android:fillColor="#FFFFFF" android:pathData="M37,28h24l13,13v37c0,1.1 -0.9,2 -2,2H37c-1.1,0 -2,-0.9 -2,-2V30c0,-1.1 0.9,-2 2,-2z" />
+    <path android:fillColor="#C5D3EA" android:pathData="M61,28v11c0,1.1 0.9,2 2,2h11z" />
+    <path android:fillColor="#2B579A" android:pathData="M42,50h25v3H42zM42,58h25v3H42zM42,66h16v3H42z" />
+</vector>
