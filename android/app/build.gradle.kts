@@ -61,9 +61,53 @@ val rustKotlinBindings = tasks.register<Cargo>("rustKotlinBindings") {
     ))
 }
 
+/**
+ * Downloads one bblanchon/pdfium-binaries archive per ABI, checks its SHA-256 and unpacks its libpdfium.so
+ * into [outputDir]/<abi>/. Gradle skips it while the inputs and the output are unchanged.
+ */
+abstract class PdfiumLibs : DefaultTask() {
+    /** The chromium/<release> tag; it must match the `pdfium_<release>` feature of pdfium-render in core/Cargo.toml. */
+    @get:Input abstract val release: Property<String>
+    /** ABI to "<archive name> <sha256>". */
+    @get:Input abstract val archives: MapProperty<String, String>
+    @get:OutputDirectory abstract val outputDir: DirectoryProperty
+    @get:Inject abstract val archiveOps: ArchiveOperations
+    @get:Inject abstract val fileOps: FileSystemOperations
+
+    @TaskAction fun run() {
+        val out = outputDir.get().asFile
+        fileOps.delete { delete(out) }
+        for ((abi, spec) in archives.get()) {
+            val (name, sha256) = spec.split(' ')
+            val url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/${release.get()}/$name"
+            val tgz = File(temporaryDir, name)
+            java.net.URI(url).toURL().openStream().use { input -> tgz.outputStream().use { input.copyTo(it) } }
+            val actual = java.security.MessageDigest.getInstance("SHA-256").digest(tgz.readBytes()).joinToString("") { "%02x".format(it) }
+            check(actual == sha256) { "$url has SHA-256 $actual, expected $sha256" }
+            fileOps.copy {
+                from(archiveOps.tarTree(archiveOps.gzip(tgz)))
+                include("lib/libpdfium.so")
+                eachFile { path = "libpdfium.so" }
+                includeEmptyDirs = false
+                into(File(out, abi))
+            }
+        }
+    }
+}
+
+val pdfiumLibs = tasks.register<PdfiumLibs>("pdfiumLibs") {
+    release.set("8125")
+    archives.set(mapOf(
+        "arm64-v8a" to "pdfium-android-arm64.tgz 0495e57163429937caaee1bdd9b07924a7098dbd51d1b97645d124e349f097b4",
+        "x86_64" to "pdfium-android-x64.tgz bd68707f29f2316c20f9d5c793b8731796a4a65408ac4d3c30bc606390354e41",
+    ))
+    outputDir.set(layout.buildDirectory.dir("pdfium/jniLibs"))
+}
+
 androidComponents {
     onVariants { variant ->
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, Cargo::outputDir)
+        variant.sources.jniLibs?.addGeneratedSourceDirectory(pdfiumLibs, PdfiumLibs::outputDir)
         variant.sources.kotlin?.addGeneratedSourceDirectory(rustKotlinBindings, Cargo::outputDir)
     }
 }

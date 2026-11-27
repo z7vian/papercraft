@@ -28,6 +28,7 @@ betteroffice-docx = { version = "0.6.0", default-features = false, features = ["
 betteroffice-pptx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
 betteroffice-xlsx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
 office_oxide = "0.1.17"
+pdfium-render = { version = "0.9.6", default-features = false, features = ["pdfium_8125"] } # bindings only; libpdfium.so is bblanchon/pdfium-binaries chromium/8125 (build.gradle.kts, ci.yml)
 
 [profile.release]
 lto = true
