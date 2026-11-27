@@ -114,7 +114,9 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                     LaunchedEffect(it) { saveThumb(it.asAndroidBitmap()) }
                     ImageViewer(it, file.name, toggle)
                 }
-                Viewer.Office -> Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
+                Viewer.Office -> if (categoryOf(file.ext) == Category.Sheets) {
+                    Loaded(file, { SheetGridBook.open(this, file) }, release = SheetGridBook::close) { SheetGrid(it, barSpace, chrome, toggle, saveThumb) }
+                } else Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
                     PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb, find)
                 }
                 Viewer.Pdf -> PdfUnlock(file) { password, attempt, locked ->
@@ -130,7 +132,7 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                 exit = slideOutVertically(tween(200)) { -it } + fadeOut(tween(150)),
             ) {
                 if (find.open) FindBar(find, WindowInsets.statusBarsIgnoringVisibility)
-                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if (viewer == Viewer.Office || viewer == Viewer.Pdf) find::show else null)
+                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if ((viewer == Viewer.Office && categoryOf(file.ext) != Category.Sheets) || viewer == Viewer.Pdf) find::show else null)
             }
         }
     } else {
