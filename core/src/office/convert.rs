@@ -18,7 +18,10 @@ use crate::CoreError;
 pub(crate) fn to_ooxml(bytes: Vec<u8>, family: OfficeFamily) -> Result<Vec<u8>, CoreError> {
     match family {
         OfficeFamily::Document => doc::to_docx(bytes),
-        OfficeFamily::Presentation => via_model(bytes, DocumentFormat::Ppt),
+        OfficeFamily::Presentation => {
+            super::pptx::reject_powerpoint95(&bytes)?;
+            via_model(bytes, DocumentFormat::Ppt)
+        }
         OfficeFamily::Spreadsheet => xls::to_xlsx(bytes),
     }
 }

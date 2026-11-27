@@ -103,8 +103,7 @@ impl OfficeDoc {
         Ok(Arc::new(Self { jobs, page_count, page_names }))
     }
 
-    /// `None` for documents: their page count is known only after layout, so draw pages until
-    /// [`Self::render_page`] returns `None`.
+    /// Pages, slides or sheets in the file. Documents count theirs from the layout made at open.
     pub fn page_count(&self) -> Option<u32> {
         self.page_count
     }
