@@ -1389,7 +1389,7 @@ dependencies = [
  "mail-parser",
  "oem_cp",
  "office_oxide",
- "quick-xml 0.42.0",
+ "quick-xml 0.41.0",
  "uniffi",
 ]
 

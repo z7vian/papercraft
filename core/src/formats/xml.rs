@@ -51,21 +51,23 @@ fn pretty(xml: &str) -> Option<Vec<String>> {
     let (mut depth, mut elements) = (0usize, 0usize);
     loop {
         let event = reader.read_event().ok()?;
+        // quick-xml hands back byte slices of the input; they split it only at ASCII markup, so they stay valid UTF-8.
+        let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         // Text, entity references and CDATA in a row are one run of character data.
         match &event {
             Event::Text(t) => {
-                text.push_str(t);
+                text.push_str(&s(t));
                 continue;
             }
             Event::GeneralRef(r) => {
                 text.push('&');
-                text.push_str(r);
+                text.push_str(&s(r));
                 text.push(';');
                 continue;
             }
             Event::CData(c) => {
                 text.push_str("<![CDATA[");
-                text.push_str(c);
+                text.push_str(&s(c));
                 text.push_str("]]>");
                 continue;
             }
@@ -79,20 +81,20 @@ fn pretty(xml: &str) -> Option<Vec<String>> {
             Event::Start(e) => {
                 depth += 1;
                 elements += 1;
-                toks.push(Tok::Open(format!("<{}>", &*e)));
+                toks.push(Tok::Open(format!("<{}>", s(&e))));
             }
             Event::End(e) => {
                 depth = depth.checked_sub(1)?;
-                toks.push(Tok::Close(format!("</{}>", &*e)));
+                toks.push(Tok::Close(format!("</{}>", s(&e))));
             }
             Event::Empty(e) => {
                 elements += 1;
-                toks.push(Tok::Line(format!("<{}/>", &*e)));
+                toks.push(Tok::Line(format!("<{}/>", s(&e))));
             }
-            Event::Comment(c) => toks.push(Tok::Line(format!("<!--{}-->", &*c))),
-            Event::Decl(d) => toks.push(Tok::Line(format!("<?{}?>", &*d))),
-            Event::PI(p) => toks.push(Tok::Line(format!("<?{}?>", &*p))),
-            Event::DocType(d) => toks.push(Tok::Line(format!("<!DOCTYPE {}>", d.trim()))),
+            Event::Comment(c) => toks.push(Tok::Line(format!("<!--{}-->", s(&c)))),
+            Event::Decl(d) => toks.push(Tok::Line(format!("<?{}?>", s(&d)))),
+            Event::PI(p) => toks.push(Tok::Line(format!("<?{}?>", s(&p)))),
+            Event::DocType(d) => toks.push(Tok::Line(format!("<!DOCTYPE {}>", s(&d).trim()))),
             Event::Eof => break,
             Event::Text(_) | Event::GeneralRef(_) | Event::CData(_) => unreachable!("handled above"),
         }

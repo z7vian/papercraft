@@ -241,8 +241,9 @@ mod tests {
         assert_eq!(rows[1], ["Whan that aprill", "2.5", "2016-05-24"]);
         assert_eq!(rows[2][0], "普林斯顿大学");
         assert_eq!(rows[3][0], "جامعة برنستون");
+        // GBK text; its leading space is part of the stored value.
         let rows = fixture("testDBF_gb18030.dbf");
-        assert_eq!(rows, [["TEXTFIELD"], ["It was the best of times"], ["虽然该指令经过重新发布"], ["it was the worst of times"]]);
+        assert_eq!(rows, [["TEXTFIELD"], ["It was the best of times"], [" 虽然该指令经过重新发布"], ["it was the worst of times"]]);
     }
 
     #[test]
