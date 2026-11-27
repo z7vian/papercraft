@@ -25,7 +25,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -51,13 +50,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.paneTitle
@@ -65,7 +61,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -166,24 +161,6 @@ private fun RecentRow(file: DocFile, onOpen: () -> Unit, onRemove: () -> Unit) {
     ) { Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }
 }
 
-/** Colored tile with the extension, like WPS/Office file icons. Decorative: the row text already says the type. */
-@Composable
-fun FileBadge(ext: String, size: Dp = 44.dp) {
-    Box(
-        Modifier.size(size).clip(RoundedCornerShape(size * 0.23f))
-            .background(categoryOf(ext)?.color ?: Color(0xFF6B6B6B))
-            .clearAndSetSemantics {},
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            ext.take(4).uppercase().ifEmpty { "?" },
-            color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false,
-            // Sized in dp on purpose so it can't overflow the tile at large font settings.
-            fontSize = with(LocalDensity.current) { (size * 0.27f).toSp() },
-        )
-    }
-}
-
 @Composable
 private fun EmptyState(filter: Category?, modifier: Modifier) {
     Column(
@@ -203,7 +180,7 @@ private fun EmptyState(filter: Category?, modifier: Modifier) {
             style = MaterialTheme.typography.titleLarge,
         )
         Text(
-            "Open a PDF, picture, CSV spreadsheet, text file or saved web page.",
+            "Open $openableHint.",
             Modifier.padding(top = 8.dp),
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
