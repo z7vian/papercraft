@@ -63,23 +63,15 @@ fn push_body(body: &TextBody, out: &mut String) {
     }
 }
 
-/// PowerPoint 95 and older keep their slides in records the converter can't read, so converting one gives an
-/// empty deck. Their mark (as Apache POI reads it): a `PP40` stream, or a `Current User` stream that is only a
-/// 4-byte length and a user name. A dual-storage file also holds a PowerPoint 97 copy, which converts fine.
-// Limit: these files are refused, not shown; a PowerPoint 95 record reader lifts it.
-pub(crate) fn reject_powerpoint95(bytes: &[u8]) -> Result<(), CoreError> {
+/// PowerPoint 95 and older keep their slides in records office_oxide's converter can't read, so they go to
+/// `convert/ppt95.rs` instead. Their mark (as Apache POI reads it): a `PP40` stream, or a `Current User` stream
+/// that is only a 4-byte length and a user name. A dual-storage file also holds a PowerPoint 97 copy, which
+/// office_oxide converts.
+pub(crate) fn is_powerpoint95(bytes: &[u8]) -> bool {
     // Not a compound file: the converter reports what is wrong with it.
-    let Ok(mut cfb) = CfbReader::new(Cursor::new(bytes)) else { return Ok(()) };
-    if cfb.has_root_entry("PP97_DUALSTORAGE") {
-        return Ok(());
-    }
-    let old = cfb.has_root_entry("PP40") || cfb.open_stream("Current User").is_ok_and(|user| is_pre97_user(&user));
-    if old {
-        return Err(CoreError::BadFile(
-            "PowerPoint 95 and older files are not supported. Save it as .pptx in PowerPoint, then open that.".into(),
-        ));
-    }
-    Ok(())
+    let Ok(mut cfb) = CfbReader::new(Cursor::new(bytes)) else { return false };
+    !cfb.has_root_entry("PP97_DUALSTORAGE")
+        && (cfb.has_root_entry("PP40") || cfb.open_stream("Current User").is_ok_and(|user| is_pre97_user(&user)))
 }
 
 /// A PowerPoint 97 `Current User` stream is a 28-byte-or-longer record; PowerPoint 95 writes a length-prefixed name.
@@ -118,8 +110,7 @@ impl Pages for Slides {
 
 #[cfg(test)]
 mod tests {
-    use super::reject_powerpoint95;
-    use crate::CoreError;
+    use super::is_powerpoint95;
     use crate::office::{OfficeDoc, OfficeFamily};
 
     fn fixture(name: &str) -> Vec<u8> {
@@ -146,7 +137,7 @@ mod tests {
     #[test]
     fn legacy_ppt_slide_text_and_notes() {
         let bytes = fixture("basic_test_ppt_file.ppt");
-        reject_powerpoint95(&bytes).unwrap();
+        assert!(!is_powerpoint95(&bytes));
         let doc = OfficeDoc::open(bytes, OfficeFamily::Presentation).unwrap();
         assert_eq!(doc.page_count(), Some(2));
         assert!(doc.page_text(0).unwrap().unwrap().contains("This is a test title"));
@@ -159,11 +150,9 @@ mod tests {
     // PPT95.ppt and pp40only.ppt: Apache POI test-data (Apache-2.0), their main stream cut to 8 KB to fit the
     // fixture size cap; every other stream and the directory are the original's.
     #[test]
-    fn powerpoint95_and_older_are_refused() {
-        for name in ["PPT95.ppt", "pp40only.ppt"] {
-            let Err(CoreError::BadFile(reason)) = reject_powerpoint95(&fixture(name)) else { panic!("{name} accepted") };
-            assert!(reason.starts_with("PowerPoint 95 and older files are not supported"), "{name}: {reason}");
-        }
-        reject_powerpoint95(&fixture("KEY02.pptx")).unwrap();
+    fn powerpoint95_and_older_are_detected() {
+        assert!(is_powerpoint95(&fixture("PPT95.ppt")));
+        assert!(is_powerpoint95(&fixture("pp40only.ppt")));
+        assert!(!is_powerpoint95(&fixture("KEY02.pptx")));
     }
 }
