@@ -51,7 +51,7 @@ pub(super) fn to_pptx(bytes: &[u8]) -> Result<Vec<u8>, CoreError> {
     let mut cfb = CfbReader::new(Cursor::new(bytes)).map_err(|e| bad("presentation", e))?;
     if cfb.has_root_entry("PP40") || !cfb.has_stream("PowerPoint Document") {
         return Err(CoreError::BadFile(
-            "PowerPoint 95 and older files are not supported. Save it as .pptx in PowerPoint, then open that.".into(),
+            "PowerPoint 4.0 and older files are not supported. Save it as .pptx in PowerPoint, then open that.".into(),
         ));
     }
     let stream = cfb.open_stream("PowerPoint Document").map_err(|e| bad("presentation", e))?;
@@ -308,6 +308,6 @@ mod tests {
     #[test]
     fn powerpoint4_is_refused() {
         let Err(CoreError::BadFile(reason)) = to_pptx(&fixture("pptx/pp40only.ppt")) else { panic!("accepted") };
-        assert!(reason.starts_with("PowerPoint 95 and older files are not supported"), "{reason}");
+        assert!(reason.starts_with("PowerPoint 4.0 and older files are not supported"), "{reason}");
     }
 }
