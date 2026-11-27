@@ -42,14 +42,14 @@ pub struct SheetCellRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
-pub enum SheetHAlign {
+pub enum SheetEditHAlign {
     Left,
     Center,
     Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
-pub enum SheetVAlign {
+pub enum SheetEditVAlign {
     Top,
     Middle,
     Bottom,
@@ -72,7 +72,7 @@ pub enum SheetNumberFormat {
 /// A cell's look. Setting: `None` leaves that property as it is. Reading: every property is filled.
 /// Colours are `#rrggbb`.
 #[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
-pub struct SheetCellStyle {
+pub struct SheetStyleEdit {
     #[uniffi(default)]
     pub bold: Option<bool>,
     #[uniffi(default)]
@@ -82,9 +82,9 @@ pub struct SheetCellStyle {
     #[uniffi(default)]
     pub fill_color: Option<String>,
     #[uniffi(default)]
-    pub horizontal: Option<SheetHAlign>,
+    pub horizontal: Option<SheetEditHAlign>,
     #[uniffi(default)]
-    pub vertical: Option<SheetVAlign>,
+    pub vertical: Option<SheetEditVAlign>,
     #[uniffi(default)]
     pub wrap: Option<bool>,
     #[uniffi(default)]
@@ -153,21 +153,21 @@ fn apply(book: &mut Workbook, ops: Vec<Op>) -> Result<(), CoreError> {
     book.apply_ops(ops, options()).map(drop).map_err(refused)
 }
 
-fn style_patch(style: &SheetCellStyle) -> StylePatch {
+fn style_patch(style: &SheetStyleEdit) -> StylePatch {
     StylePatch {
         bold: style.bold,
         italic: style.italic,
         text_color: style.text_color.clone(),
         fill_color: style.fill_color.clone(),
         horizontal_alignment: style.horizontal.map(|h| match h {
-            SheetHAlign::Left => HorizontalAlignment::Left,
-            SheetHAlign::Center => HorizontalAlignment::Center,
-            SheetHAlign::Right => HorizontalAlignment::Right,
+            SheetEditHAlign::Left => HorizontalAlignment::Left,
+            SheetEditHAlign::Center => HorizontalAlignment::Center,
+            SheetEditHAlign::Right => HorizontalAlignment::Right,
         }),
         vertical_alignment: style.vertical.map(|v| match v {
-            SheetVAlign::Top => VerticalAlignment::Top,
-            SheetVAlign::Middle => VerticalAlignment::Middle,
-            SheetVAlign::Bottom => VerticalAlignment::Bottom,
+            SheetEditVAlign::Top => VerticalAlignment::Top,
+            SheetEditVAlign::Middle => VerticalAlignment::Middle,
+            SheetEditVAlign::Bottom => VerticalAlignment::Bottom,
         }),
         text_wrapping: style.wrap.map(|wrap| if wrap { TextWrapping::Wrap } else { TextWrapping::Overflow }),
         ..StylePatch::default()
@@ -284,7 +284,7 @@ impl SheetEditor {
     }
 
     /// Applies every property `style` sets to `range` as one undo step.
-    pub fn set_cell_style(&self, sheet: u32, range: SheetCellRange, style: SheetCellStyle) -> Result<(), CoreError> {
+    pub fn set_cell_style(&self, sheet: u32, range: SheetCellRange, style: SheetStyleEdit) -> Result<(), CoreError> {
         self.ask(move |book| {
             let (sheet, range) = (SheetId(sheet), cell_range(range));
             let mut ops = Vec::with_capacity(2);
@@ -307,24 +307,24 @@ impl SheetEditor {
         })
     }
 
-    pub fn get_cell_style(&self, sheet: u32, row: u32, col: u32) -> Result<SheetCellStyle, CoreError> {
+    pub fn get_cell_style(&self, sheet: u32, row: u32, col: u32) -> Result<SheetStyleEdit, CoreError> {
         self.ask(move |book| {
             let at = CellRef::new(row, col);
             let f = book.selection_formatting(SheetId(sheet), CellRange::new(at, at)).map_err(refused)?;
-            Ok(SheetCellStyle {
+            Ok(SheetStyleEdit {
                 bold: f.bold,
                 italic: f.italic,
                 text_color: f.text_color,
                 fill_color: f.fill_color,
                 horizontal: f.horizontal_alignment.map(|h| match h {
-                    HorizontalAlignment::Left => SheetHAlign::Left,
-                    HorizontalAlignment::Center => SheetHAlign::Center,
-                    HorizontalAlignment::Right => SheetHAlign::Right,
+                    HorizontalAlignment::Left => SheetEditHAlign::Left,
+                    HorizontalAlignment::Center => SheetEditHAlign::Center,
+                    HorizontalAlignment::Right => SheetEditHAlign::Right,
                 }),
                 vertical: f.vertical_alignment.map(|v| match v {
-                    VerticalAlignment::Top => SheetVAlign::Top,
-                    VerticalAlignment::Middle => SheetVAlign::Middle,
-                    VerticalAlignment::Bottom => SheetVAlign::Bottom,
+                    VerticalAlignment::Top => SheetEditVAlign::Top,
+                    VerticalAlignment::Middle => SheetEditVAlign::Middle,
+                    VerticalAlignment::Bottom => SheetEditVAlign::Bottom,
                 }),
                 wrap: f.text_wrapping.map(|w| w == TextWrapping::Wrap),
                 number_format: f.number_format.map(|kind| number_format(kind, f.number_format_pattern)),
@@ -523,13 +523,13 @@ mod tests {
     fn save_and_reopen_keeps_values_and_styles() {
         let editor = chain();
         editor.set_cell(0, 0, 0, "10".into()).unwrap();
-        let look = SheetCellStyle {
+        let look = SheetStyleEdit {
             bold: Some(true),
             italic: Some(true),
             text_color: Some("#C00000".into()),
             fill_color: Some("#ffff00".into()),
-            horizontal: Some(SheetHAlign::Center),
-            vertical: Some(SheetVAlign::Top),
+            horizontal: Some(SheetEditHAlign::Center),
+            vertical: Some(SheetEditVAlign::Top),
             wrap: Some(true),
             number_format: None,
         };
@@ -552,13 +552,13 @@ mod tests {
         assert_eq!(shown(&reopened, 0, 1, 0), "300.00%");
         assert_eq!(
             reopened.get_cell_style(0, 0, 0).unwrap(),
-            SheetCellStyle {
+            SheetStyleEdit {
                 bold: Some(true),
                 italic: Some(true),
                 text_color: Some("#c00000".into()),
                 fill_color: Some("#ffff00".into()),
-                horizontal: Some(SheetHAlign::Center),
-                vertical: Some(SheetVAlign::Top),
+                horizontal: Some(SheetEditHAlign::Center),
+                vertical: Some(SheetEditVAlign::Top),
                 wrap: Some(true),
                 number_format: Some(SheetNumberFormat::General),
             }
