@@ -81,6 +81,9 @@ import java.io.FileNotFoundException
 fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
     val context = LocalContext.current
     val viewer = viewerOf(file.ext)
+    val editor = editorOf(file.ext)
+    var editing by rememberSaveable { mutableStateOf(false) }
+    if (editing && editor != null) return editor.screen(file, false) { editing = false }
     var status by remember { mutableStateOf<String?>(null) }
     var chrome by rememberSaveable { mutableStateOf(true) }
     val find = remember { FindState() }
@@ -132,7 +135,7 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                 exit = slideOutVertically(tween(200)) { -it } + fadeOut(tween(150)),
             ) {
                 if (find.open) FindBar(find, WindowInsets.statusBarsIgnoringVisibility)
-                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if ((viewer == Viewer.Office && categoryOf(file.ext) != Category.Sheets) || viewer == Viewer.Pdf) find::show else null)
+                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if ((viewer == Viewer.Office && categoryOf(file.ext) != Category.Sheets) || viewer == Viewer.Pdf) find::show else null, onEdit = editor?.let { { editing = true } })
             }
         }
     } else {
@@ -176,7 +179,7 @@ private fun SystemBarsVisible(visible: Boolean) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets, onFind: (() -> Unit)?) {
+private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets, onFind: (() -> Unit)?, onEdit: (() -> Unit)? = null) {
     val context = LocalContext.current
     var menu by remember { mutableStateOf(false) }
     TopAppBar(
@@ -192,6 +195,7 @@ private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scr
         navigationIcon = { IconButton(onBack) { Icon(painterResource(R.drawable.ic_back), "Back") } },
         actions = {
             onFind?.let { IconButton(it) { Icon(painterResource(R.drawable.ic_search), "Find in file") } }
+            onEdit?.let { IconButton(it) { Icon(painterResource(R.drawable.ic_edit), "Edit") } }
             IconButton({ share(context, file.uri) }) { Icon(painterResource(R.drawable.ic_share), "Share") }
             Box {
                 IconButton({ menu = true }) { Icon(painterResource(R.drawable.ic_more), "More options") }
@@ -245,7 +249,7 @@ private fun <T : Any> Loaded(
     content(r.getOrElse { e -> return if (e is PasswordProtectedException && locked != null) locked(e) else CantOpen(file, friendlyError(e)) })
 }
 
-private fun friendlyError(t: Throwable): String = when (t) {
+internal fun friendlyError(t: Throwable): String = when (t) {
     is FileNotFoundException, is SecurityException ->
         "Papercraft can't reach this file anymore. It may have been moved or deleted."
     is TooBigException, is OutOfMemoryError -> "This file is too big to open for now."

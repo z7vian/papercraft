@@ -70,6 +70,7 @@ fun App(launchUri: Uri?, themeMode: ThemeMode, onThemeChange: (ThemeMode) -> Uni
     var recents by remember { mutableStateOf(store.load()) }
     var file by rememberSaveable(stateSaver = DocFileSaver) { mutableStateOf<DocFile?>(null) }
     var launching by rememberSaveable { mutableStateOf(launchUri != null) }
+    var restored by rememberSaveable(stateSaver = DocFileSaver) { mutableStateOf<DocFile?>(null) }
 
     suspend fun openUri(uri: Uri) {
         // Keeps access after restart (read and write when the provider allows it), if the sending app allows it.
@@ -110,6 +111,10 @@ fun App(launchUri: Uri?, themeMode: ThemeMode, onThemeChange: (ThemeMode) -> Uni
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface))
         return
     }
+    RecoveryPrompt { restored = it }
+    val recovering = restored
+    val recoveryEditor = recovering?.let { editorOf(it.ext) }
+    if (recovering != null && recoveryEditor != null) return recoveryEditor.screen(recovering, true) { restored = null }
     AnimatedContent(
         targetState = file,
         contentKey = { it?.uri },
