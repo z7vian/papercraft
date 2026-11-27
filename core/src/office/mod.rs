@@ -36,6 +36,10 @@ trait Pages {
     fn notes(&self, _index: u32) -> Result<Option<String>, CoreError> {
         Ok(None)
     }
+    /// How many blocks of page `index` the engine could not read and left off it; 0 past the last page.
+    fn skipped_on_page(&self, _index: u32) -> Result<u32, CoreError> {
+        Ok(0)
+    }
 }
 
 /// A Word, Excel or PowerPoint file, opened once and drawn one page at a time.
@@ -126,5 +130,11 @@ impl OfficeDoc {
     /// The slide's speaker notes; `None` when it has none, past the last slide, or for documents and workbooks.
     pub fn notes(&self, index: u32) -> Result<Option<String>, CoreError> {
         self.ask(move |doc| doc.notes(index))
+    }
+
+    /// How many blocks of page `index` (paragraphs, tables, pictures, shapes) the engine could not read and left out
+    /// of its drawing; 0 when nothing is missing or past the last page.
+    pub fn skipped_on_page(&self, index: u32) -> Result<u32, CoreError> {
+        self.ask(move |doc| doc.skipped_on_page(index))
     }
 }
