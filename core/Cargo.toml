@@ -35,6 +35,7 @@ betteroffice-opc = "0.6.0"
 serde_json = "1"
 betteroffice-pptx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
 betteroffice-xlsx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
+betteroffice-xlsx-render = "0.6.0"
 office_oxide = "0.1.17"
 # The spreadsheet grid reads cells straight from the engine's parser (`sheet.rs`).
 betteroffice-xlsx-model = "0.6.0"
@@ -42,6 +43,9 @@ betteroffice-xlsx-parse = "0.6.0"
 quick-xml = "0.41"
 oem_cp = "2.1"
 pdfium-render = { version = "0.9.6", default-features = false, features = ["pdfium_8125"] } # bindings only; libpdfium.so is bblanchon/pdfium-binaries chromium/8125 (build.gradle.kts, ci.yml)
+
+[dev-dependencies]
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true

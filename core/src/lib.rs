@@ -6,6 +6,7 @@ mod office;
 mod pdf;
 mod sheet;
 mod table;
+mod sheet_edit;
 mod text;
 mod tiff;
 

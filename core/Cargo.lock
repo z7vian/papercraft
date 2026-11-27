@@ -1379,6 +1379,7 @@ dependencies = [
  "betteroffice-opc",
  "betteroffice-pptx",
  "betteroffice-xlsx",
+ "betteroffice-xlsx-render",
  "chardetng",
  "csv",
  "encoding_rs",
@@ -1387,6 +1388,7 @@ dependencies = [
  "office_oxide",
  "serde_json",
  "uniffi",
+ "zip",
 ]
 
 [[package]]
