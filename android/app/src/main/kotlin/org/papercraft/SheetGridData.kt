@@ -43,6 +43,10 @@ class SheetGridBook private constructor(private val doc: SheetDoc) {
         doc.cells(sheet.index.toUInt(), key.firstRow.toUInt(), GRID_BLOCK_ROWS.toUInt(), key.firstCol.toUInt(), GRID_BLOCK_COLS.toUInt())
             .map { GridCellDraw.of(it, sheet, fonts) }
 
+    /** Blocking: the cells of sheet [index] showing [query], row by row as (row, col), at most [limit]. */
+    fun findCells(index: Int, query: String, limit: Int): List<Pair<Int, Int>> =
+        doc.findCells(index.toUInt(), query, limit.toUInt()).map { it.row.toInt() to it.col.toInt() }
+
     /** Frees the file; calls still running finish first. */
     fun close() = doc.close()
 

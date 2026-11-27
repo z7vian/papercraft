@@ -60,7 +60,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
@@ -104,18 +106,19 @@ private const val EXCEL_GRIDLINE = 0xFFD4D4D4.toInt()
 /** Where a pane was scrolled, in sheet pixels past its frozen tracks. */
 private class GridScroll(val x: Double, val y: Double)
 
-/** A pending jump to a cell, from a link. */
-private data class GridJump(val sheet: Int, val row: Int, val col: Int)
+/** A pending jump to a cell, from a link (cell to the top-left) or find ([reveal]: scroll only as far as it takes to show it). */
+private data class GridJump(val sheet: Int, val row: Int, val col: Int, val reveal: Boolean = false)
 
 /**
  * A spreadsheet as Excel shows it: headers, frozen panes, merged cells and cell formatting, with sheet
  * tabs below. Cells load window by window as they scroll into view. Fills the screen under floating
- * bars like [PagedViewer]; [padding] keeps the headers clear of the top bar while it shows.
+ * bars like [PagedViewer]; [padding] keeps the headers clear of the top bar while it shows. [find] searches
+ * every visible sheet, jumps to the current match and outlines the matches in view.
  */
 // Limit: screen readers hear the sheet's name and size, not its cells; per-cell semantics for the visible window lift it.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SheetGrid(book: SheetGridBook, padding: PaddingValues, chrome: Boolean, onTap: () -> Unit, onFirstPage: (Bitmap) -> Unit) {
+fun SheetGrid(book: SheetGridBook, padding: PaddingValues, chrome: Boolean, onTap: () -> Unit, onFirstPage: (Bitmap) -> Unit, find: FindState? = null) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var sheet by rememberSaveable(book) { mutableIntStateOf(book.firstSheet) }
@@ -133,6 +136,17 @@ fun SheetGrid(book: SheetGridBook, padding: PaddingValues, chrome: Boolean, onTa
         animate(zoom.floatValue, target.coerceIn(GRID_MIN_ZOOM, GRID_MAX_ZOOM), animationSpec = tween(240, easing = FastOutSlowInEasing)) { value, _ ->
             zoom.floatValue = value
         }
+    }
+
+    val ownFind = remember { FindState() }
+    val finder = find ?: ownFind
+    val hits = rememberHits<CellHit>(finder, book, startAt = { it.firstFromSheet(sheet, tabs) }) { query ->
+        withContext(Dispatchers.IO) { findInSheets(tabs) { index, limit -> book.findCells(index, query, limit) } }
+    }
+    LaunchedEffect(hits, finder.moves) {
+        val hit = hits.getOrNull(finder.current) ?: return@LaunchedEffect
+        jump = GridJump(hit.sheet, hit.row, hit.col, reveal = true)
+        sheet = hit.sheet
     }
 
     val onLink: (GridLinkTarget) -> Unit = { target ->
@@ -160,12 +174,14 @@ fun SheetGrid(book: SheetGridBook, padding: PaddingValues, chrome: Boolean, onTa
             }
             else -> result.fold(
                 { grid ->
+                    val found = remember(hits, grid) { hits.filter { it.sheet == grid.index } }
                     key(grid) {
                         GridPane(
                             book, grid, zoom, top, bottomBar, scrolls,
                             jump?.takeIf { it.sheet == grid.index }, { jump = null },
                             onTap, onLink,
                             if (thumbSaved) null else ({ bitmap: Bitmap -> thumbSaved = true; onFirstPage(bitmap) }),
+                            found, hits.getOrNull(finder.current)?.takeIf { it.sheet == grid.index },
                         )
                     }
                 },
@@ -227,6 +243,9 @@ private fun GridPane(
     onTap: () -> Unit,
     onLink: (GridLinkTarget) -> Unit,
     onFirstFrame: ((Bitmap) -> Unit)?,
+    /** Find matches on this sheet, and the one shown when it is here. */
+    found: List<CellHit>,
+    shown: CellHit?,
 ) {
     val density = LocalDensity.current
     val scheme = MaterialTheme.colorScheme
@@ -238,6 +257,9 @@ private fun GridPane(
         val digits = max(3, (grid.rowCount + 1).toString().length)
         android.graphics.Paint().apply { textSize = headerTextPx }.measureText("0".repeat(digits)) + with(density) { 16.dp.toPx() }
     }
+    val matchFill = scheme.primary.copy(alpha = 0.2f)
+    val shownLine = scheme.primary
+    val shownStroke = with(density) { 2.dp.toPx() }
     val painter = remember(grid, scheme, headerTextPx) {
         GridPainter(
             grid, cells,
@@ -309,8 +331,14 @@ private fun GridPane(
         val to = jump ?: return@LaunchedEffect
         if (area == IntSize.Zero) return@LaunchedEffect
         val v = viewport()
-        if (to.col >= v.frozenCols) scrollX = grid.cols.start(to.col) - grid.cols.start(v.frozenCols)
-        if (to.row >= v.frozenRows) scrollY = grid.rows.start(to.row) - grid.rows.start(v.frozenRows)
+        if (to.reveal) {
+            val cell = grid.merges.span(to.row, to.col)
+            scrollX = grid.cols.reveal(cell.firstCol, cell.lastCol, v.frozenCols, scrollX, ((v.width - v.bodyX) / v.scale).toDouble())
+            scrollY = grid.rows.reveal(cell.firstRow, cell.lastRow, v.frozenRows, scrollY, ((v.height - v.bodyY - bottomPad) / v.scale).toDouble())
+        } else {
+            if (to.col >= v.frozenCols) scrollX = grid.cols.start(to.col) - grid.cols.start(v.frozenCols)
+            if (to.row >= v.frozenRows) scrollY = grid.rows.start(to.row) - grid.rows.start(v.frozenRows)
+        }
         scrollBy(0f, 0f)
         onJumped()
     }
@@ -414,7 +442,23 @@ private fun GridPane(
             },
     ) {
         cells.version // redraw as blocks arrive
-        drawIntoCanvas { painter.draw(it.nativeCanvas, viewport()) }
+        val v = viewport()
+        drawIntoCanvas { painter.draw(it.nativeCanvas, v) }
+        for (hit in found) {
+            // Limit: a match anchoring a merge that starts off screen isn't shaded where the merge reaches into view; test merges in view instead of anchors to lift it.
+            if (hit == shown || (hit.row >= v.frozenRows && hit.row !in v.bodyRows) || (hit.col >= v.frozenCols && hit.col !in v.bodyCols)) continue
+            val box = v.boxOf(grid.merges.span(hit.row, hit.col)) ?: continue
+            drawRect(matchFill, Offset(box.left, box.top), Size(box.right - box.left, box.bottom - box.top))
+        }
+        shown?.let { v.boxOf(grid.merges.span(it.row, it.col)) }?.let { box ->
+            val size = Size(box.right - box.left, box.bottom - box.top)
+            drawRect(matchFill, Offset(box.left, box.top), size)
+            val inset = shownStroke / 2
+            drawRect(
+                shownLine, Offset(box.left + inset, box.top + inset),
+                Size((size.width - shownStroke).coerceAtLeast(0f), (size.height - shownStroke).coerceAtLeast(0f)), style = Stroke(shownStroke),
+            )
+        }
     }
 }
 
