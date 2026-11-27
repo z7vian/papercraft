@@ -118,7 +118,7 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                     ImageViewer(it, file.name, toggle)
                 }
                 Viewer.Office -> if (categoryOf(file.ext) == Category.Sheets) {
-                    Loaded(file, { SheetGridBook.open(this, file) }, release = SheetGridBook::close) { SheetGrid(it, barSpace, chrome, toggle, saveThumb) }
+                    Loaded(file, { SheetGridBook.open(this, file) }, release = SheetGridBook::close) { SheetGrid(it, barSpace, chrome || find.open, toggle, saveThumb, find) }
                 } else Loaded<Pages>(file, { OfficePages.open(this, file) }, release = Pages::closeLater) {
                     PagedViewer(it, barSpace, chrome, toggle, { s -> status = s }, saveThumb, find)
                 }
@@ -135,7 +135,7 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                 exit = slideOutVertically(tween(200)) { -it } + fadeOut(tween(150)),
             ) {
                 if (find.open) FindBar(find, WindowInsets.statusBarsIgnoringVisibility)
-                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if ((viewer == Viewer.Office && categoryOf(file.ext) != Category.Sheets) || viewer == Viewer.Pdf) find::show else null, onEdit = editor?.let { { editing = true } })
+                else ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onFind = if (viewer == Viewer.Office || viewer == Viewer.Pdf) find::show else null, onEdit = editor?.let { { editing = true } })
             }
         }
     } else {
@@ -144,13 +144,13 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
             modifier = Modifier.nestedScroll(scroll.nestedScrollConnection).semantics { paneTitle = file.name },
             topBar = {
                 if (find.open) FindBar(find, TopAppBarDefaults.windowInsets)
-                else ViewerTopBar(file, status, onBack, scroll, TopAppBarDefaults.windowInsets, onFind = if (viewer == Viewer.Text) find::show else null)
+                else ViewerTopBar(file, status, onBack, scroll, TopAppBarDefaults.windowInsets, onFind = if (viewer == Viewer.Text || viewer == Viewer.Table) find::show else null)
             },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).clipToBounds()) {
                 when (viewer) {
                     Viewer.Text -> Loaded(file, { loadText(file) }) { TextViewer(it, find, monospace = file.ext == "prn") }
-                    Viewer.Table -> Loaded(file, { loadTable(file) }) { TableViewer(it) }
+                    Viewer.Table -> Loaded(file, { loadTable(file) }) { TableViewer(it, find) }
                     Viewer.Web -> Loaded(file, { loadWebPage(file) }) { WebViewer(it) }
                     Viewer.WebArchive -> Loaded(file, { loadWebArchive(file) }) { WebViewer(it) }
                     null -> CantOpen(

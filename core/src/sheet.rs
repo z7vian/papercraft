@@ -26,6 +26,9 @@ use xlsx_model::{
 use crate::CoreError;
 use crate::office::{OfficeFamily, convert};
 
+#[path = "sheet_find.rs"]
+mod find;
+
 /// Parsing recurses on nested content, as in `office/mod.rs`; Kotlin's calling threads have small stacks.
 const ENGINE_STACK: usize = 32 * 1024 * 1024;
 
