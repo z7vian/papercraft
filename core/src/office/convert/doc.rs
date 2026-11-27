@@ -296,9 +296,12 @@ fn inline_picture(data: &[u8], at: usize) -> Option<(Picture, Option<u64>, Optio
     let rest = data.get(pos..end)?;
     let shape = art::records(rest).next()?;
     let shape_len = 8 + shape.body.len();
-    let pib = art::picture_shapes(&rest[..shape_len]).first().map_or(1, |s| s.pib);
-    let store = art::store_entries(rest.get(shape_len..)?, &[]);
-    let picture = store.into_iter().nth((pib as usize).checked_sub(1)?)??;
+    // `pib` counts the document's whole picture store; the container holds only this picture's
+    // entries, so a `pib` past them means its one entry.
+    let pib = art::picture_shapes(&rest[..shape_len]).first().map_or(1, |s| s.pib) as usize;
+    let mut store = art::store_entries(rest.get(shape_len..)?, &[]);
+    let index = pib.checked_sub(1).filter(|&i| i < store.len()).unwrap_or(0);
+    let picture = store.get_mut(index).and_then(Option::take).or_else(|| store.into_iter().flatten().next())?;
     // Scaled goal size less the crop, in twips ([MS-DOC] PICF: mx/my are 1/1000).
     let size = |goal: i64, crop_a: i64, crop_b: i64, scale: i64| {
         let twips = (goal - crop_a - crop_b) * scale / 1000;
@@ -312,6 +315,7 @@ fn inline_picture(data: &[u8], at: usize) -> Option<(Picture, Option<u64>, Optio
 }
 
 /// Floating pictures: shapes anchored in the main text (`PlcSpaMom`) that show a stored picture.
+// Limit: pictures inside shape groups or headers are not placed (inline header pictures stay at the document's end, grouped floating ones are missing); walking group children and PlcSpaHdr lifts it.
 fn floating_pictures(word: &[u8], plc: &[u8], content: &[u8], ccp_text: u32) -> Vec<Placed> {
     let mut out = Vec::new();
     if plc.is_empty() || content.is_empty() {

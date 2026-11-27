@@ -27,6 +27,8 @@ pub(super) fn to_xlsx(bytes: Vec<u8>) -> Result<Vec<u8>, CoreError> {
     if book.sheets.len() != layout.sheets.len() {
         return via_model(bytes, DocumentFormat::Xls);
     }
+    // Limit: formulas arrive as their last computed values (office_oxide keeps no formula text), so an edit does not recalculate them; decoding BIFF formula tokens lifts it.
+    // Limit: embedded charts, conditional formats and data validations are not written; DrawingML chart and SpreadsheetML rule writers lift it.
     write(&book, &layout).map_err(|e| bad("file", e))
 }
 
@@ -888,6 +890,7 @@ fn comments(opc: &mut Opc, sheet_part: &PartName, n: usize, sheet: &Sheet) -> of
 }
 
 /// `xl/styles.xml`: one cell format per BIFF `XF`, in the same order, so cells keep their `XF` index.
+// Limit: colours chosen in Excel 2007+ (XFEXT theme and RGB colours) show as the nearest palette colour the XF also stores; reading XFEXT records lifts it.
 fn styles(layout: &Layout) -> String {
     let mut xml = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="{NS_MAIN}">"#);
 
