@@ -49,13 +49,13 @@ fun Context.keepAccess(uri: Uri) {
 }
 
 /** What a provider query says about a file. */
-private class Meta(val name: String?, val size: Long, val modified: Long, val flags: Int?)
+private class Meta(val name: String?, val size: Long, val modified: Long)
 
 /** One metadata query, never downloads. Null when the file is gone. Blocking. */
 private fun Context.meta(uri: Uri): Meta? {
     // Only document providers know these columns; others may reject the whole query if asked for them.
     val doc = DocumentsContract.isDocumentUri(this, uri)
-    val cols = if (doc) arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE, Document.COLUMN_LAST_MODIFIED, Document.COLUMN_FLAGS)
+    val cols = if (doc) arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE, Document.COLUMN_LAST_MODIFIED)
     else arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
     return contentResolver.query(uri, cols, null, null, null)?.use { c ->
         if (!c.moveToFirst()) return null
@@ -64,7 +64,6 @@ private fun Context.meta(uri: Uri): Meta? {
             col(OpenableColumns.DISPLAY_NAME)?.let(c::getString),
             col(OpenableColumns.SIZE)?.let(c::getLong) ?: -1,
             col(Document.COLUMN_LAST_MODIFIED)?.let(c::getLong) ?: -1,
-            col(Document.COLUMN_FLAGS)?.let(c::getInt),
         )
     }
 }
@@ -82,9 +81,10 @@ fun Context.describe(uri: Uri): DocFile {
     val ext = n.substringAfterLast('.', "").lowercase().ifEmpty {
         MimeTypeMap.getSingleton().getExtensionFromMimeType(contentResolver.getType(uri)) ?: ""
     }
-    val granted = checkCallingOrSelfUriPermission(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == PackageManager.PERMISSION_GRANTED
-    // Document providers say whether the file takes writes; for other providers the grant is all we know.
-    val writable = granted && (m?.flags?.let { it and Document.FLAG_SUPPORTS_WRITE != 0 } ?: true)
+    // The write grant decides. Document flags are only hints: on this emulator the Downloads picker granted
+    // write while the app still saw the file as read-only, and a provider that truly refuses makes the save
+    // fail with SaveException.ReadOnly.
+    val writable = checkCallingOrSelfUriPermission(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == PackageManager.PERMISSION_GRANTED
     return DocFile(uri, n, ext, m?.size ?: -1, System.currentTimeMillis(), m?.modified ?: -1, writable)
 }
 

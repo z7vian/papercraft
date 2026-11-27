@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -466,7 +467,8 @@ private fun SheetEditing(edit: EditScope<SheetDocEdit>) {
         Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 var menuOpen by remember { mutableStateOf(false) }
-                SecondaryScrollableTabRow(
+                // A tab row with no tabs crashes while measuring, so it waits for the workbook to load.
+                if (tabs.isEmpty()) Spacer(Modifier.weight(1f)) else SecondaryScrollableTabRow(
                     selectedTabIndex = tabs.indexOf(sheet).coerceAtLeast(0),
                     modifier = Modifier.weight(1f),
                     containerColor = Color.Transparent,
