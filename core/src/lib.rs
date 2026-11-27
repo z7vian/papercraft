@@ -2,6 +2,7 @@ uniffi::setup_scaffolding!();
 
 mod mhtml;
 mod office;
+mod slide_edit;
 mod table;
 mod text;
 mod tiff;

@@ -7,7 +7,7 @@ use crate::CoreError;
 
 /// The old binary formats (Office 97-2003, and WPS which shares them) as the matching OOXML package.
 // Limit: the conversion keeps text and simple layout only (images move, sheet styles drop); a faithful converter lifts it.
-pub(super) fn to_ooxml(bytes: Vec<u8>, family: OfficeFamily) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn to_ooxml(bytes: Vec<u8>, family: OfficeFamily) -> Result<Vec<u8>, CoreError> {
     let (from, to) = match family {
         OfficeFamily::Document => (DocumentFormat::Doc, DocumentFormat::Docx),
         OfficeFamily::Presentation => (DocumentFormat::Ppt, DocumentFormat::Pptx),
