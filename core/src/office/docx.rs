@@ -560,7 +560,7 @@ mod tests {
             let doc = open("WordWithAttachments.docx");
             assert_eq!(doc.page_count(), Some(2));
             let first = doc.page_text(0).unwrap().unwrap();
-            assert!(first.contains("dictionary"), "{first}");
+            assert!(first.contains("Русский вариант"), "{first}");
             let laid_out = doc.engine.stats().pagination_calls;
             for page in [1, 0] {
                 let drawn = doc.draw(page, 1.0).unwrap().unwrap();
