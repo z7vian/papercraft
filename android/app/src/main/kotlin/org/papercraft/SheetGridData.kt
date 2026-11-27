@@ -9,6 +9,7 @@ import android.text.StaticLayout
 import android.text.TextPaint
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -195,6 +196,9 @@ internal class GridCells(private val book: SheetGridBook, private val sheet: Gri
     }
     var version by mutableIntStateOf(0)
         private set
+    /** The last load failed; its blocks stay out of the cache, so the next scroll that needs them asks again. */
+    var failed by mutableStateOf(false)
+        private set
 
     operator fun get(key: GridBlockKey): GridBlock? = blocks[key]
 
@@ -202,13 +206,14 @@ internal class GridCells(private val book: SheetGridBook, private val sheet: Gri
 
     fun loaded(keys: Collection<GridBlockKey>) = keys.all { it in blocks }
 
-    /** Loads the blocks not cached yet, one at a time off the main thread. A block that fails stays empty. */
+    /** Loads the blocks not cached yet, one at a time off the main thread. */
     suspend fun load(keys: Collection<GridBlockKey>) {
         for (key in keys) {
             if (key in blocks) continue
             // One block at a time: a load the user scrolled past may still be running when the next starts.
-            val cells = withContext(Dispatchers.IO) { synchronized(fonts) { runCatching { book.cells(sheet, key, fonts) }.getOrDefault(emptyList()) } }
-            blocks[key] = GridBlock(cells, key)
+            val cells = withContext(Dispatchers.IO) { synchronized(fonts) { runCatching { book.cells(sheet, key, fonts) } } }
+            failed = cells.isFailure
+            blocks[key] = GridBlock(cells.getOrNull() ?: continue, key)
             version++
         }
     }
