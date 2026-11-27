@@ -533,9 +533,8 @@ mod tests {
         assert_eq!(text(placeholder(&now.slides[0], "ctrTitle")), "Changed");
 
         assert!(editor.undo().unwrap());
-        let restored = editor.deck().unwrap();
-        assert_eq!(restored.slides.len(), 2);
-        assert_eq!(text(placeholder(&restored.slides[0], "ctrTitle")), "Title of the first slide");
+        assert_eq!(editor.deck().unwrap(), deck);
+        assert!(!editor.can_undo().unwrap());
 
         assert!(editor.redo().unwrap());
         assert_eq!(text(placeholder(&editor.deck().unwrap().slides[0], "ctrTitle")), "Changed");
