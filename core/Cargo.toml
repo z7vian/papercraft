@@ -23,7 +23,13 @@ chardetng = "1"
 csv = "1.4.0"
 mail-parser = "1.0.2"
 image = { version = "0.25.10", default-features = false, features = ["tiff"] }
+# Latin + Hebrew/Arabic fonts only; CJK (26.7 MB) stays out of the APK.
+betteroffice-docx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
+betteroffice-pptx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
+betteroffice-xlsx = { version = "0.6.0", default-features = false, features = ["raster", "fonts-latin"] }
+hayro = "0.9.0"
 
 [profile.release]
 lto = true
+codegen-units = 1
 strip = "debuginfo" # full strip would delete the UniFFI metadata the bindings generator reads

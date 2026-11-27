@@ -1,6 +1,7 @@
 uniffi::setup_scaffolding!();
 
 mod mhtml;
+mod office;
 mod table;
 mod text;
 mod tiff;

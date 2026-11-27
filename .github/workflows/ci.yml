@@ -20,6 +20,10 @@ jobs:
       - run: cargo install cargo-ndk --version 4.1.2 --locked
       - run: sh gradlew assembleDebug # "sh" because Windows commits lose the +x bit
         working-directory: android
+      - name: Report native library and APK size
+        run: |
+          find android/app/build -name 'libpapercraft_core.so' -exec ls -l {} \;
+          ls -l android/app/build/outputs/apk/debug/*.apk
       - uses: actions/upload-artifact@v4
         with:
           name: papercraft-debug-apk
