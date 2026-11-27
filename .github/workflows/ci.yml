@@ -28,6 +28,8 @@ jobs:
         working-directory: android
       - name: Native libraries in the APK
         run: unzip -l android/app/build/outputs/apk/debug/*.apk | grep '\.so$'
+      - run: sh gradlew testDebugUnitTest
+        working-directory: android
       - uses: actions/upload-artifact@v4
         with:
           name: papercraft-debug-apk

@@ -115,9 +115,18 @@ androidComponents {
     }
 }
 
+// Lists every JVM unit test in the CI log.
+tasks.withType<Test>().configureEach {
+    testLogging {
+        events("passed", "skipped", "failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
+}
+
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2026.11.01"))
     implementation("androidx.compose.material3:material3")
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("net.java.dev.jna:jna:5.19.1@aar") // UniFFI's Kotlin code calls Rust through JNA
+    testImplementation("junit:junit:4.13.2")
 }
