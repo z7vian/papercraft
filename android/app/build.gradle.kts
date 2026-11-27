@@ -1,3 +1,6 @@
+import java.net.URI
+import java.security.MessageDigest
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -81,8 +84,8 @@ abstract class PdfiumLibs : DefaultTask() {
             val (name, sha256) = spec.split(' ')
             val url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/${release.get()}/$name"
             val tgz = File(temporaryDir, name)
-            java.net.URI(url).toURL().openStream().use { input -> tgz.outputStream().use { input.copyTo(it) } }
-            val actual = java.security.MessageDigest.getInstance("SHA-256").digest(tgz.readBytes()).joinToString("") { "%02x".format(it) }
+            URI(url).toURL().openStream().use { input -> tgz.outputStream().use { input.copyTo(it) } }
+            val actual = MessageDigest.getInstance("SHA-256").digest(tgz.readBytes()).joinToString("") { "%02x".format(it) }
             check(actual == sha256) { "$url has SHA-256 $actual, expected $sha256" }
             fileOps.copy {
                 from(archiveOps.tarTree(archiveOps.gzip(tgz)))
