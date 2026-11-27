@@ -5,8 +5,9 @@ mod mhtml;
 mod office;
 mod pdf;
 mod sheet;
-mod table;
 mod sheet_edit;
+mod slide_edit;
+mod table;
 mod text;
 mod tiff;
 
