@@ -8,6 +8,7 @@ import org.papercraft.core.DocBlock
 import org.papercraft.core.DocParagraph
 import org.papercraft.core.DocRun
 import org.papercraft.core.DocRunFormat
+import org.papercraft.core.DocRunProperty
 
 /** One run placed in its paragraph's text, at [start, end). */
 internal data class WordSpan(val start: Int, val end: Int, val run: DocRun)
@@ -228,7 +229,7 @@ internal fun selectionLook(spans: List<WordSpan>, start: Int, end: Int): WordLoo
     )
 }
 
-/** The one place a [DocRunFormat] is built: null leaves a property as it is. */
+/** The one place a [DocRunFormat] is built: null leaves a property as it is, [clear] puts properties back to the styles' look. */
 internal fun runFormat(
     bold: Boolean? = null,
     italic: Boolean? = null,
@@ -236,7 +237,13 @@ internal fun runFormat(
     strike: Boolean? = null,
     sizePt: Float? = null,
     color: String? = null,
-) = DocRunFormat(bold = bold, italic = italic, underline = underline, strike = strike, sizePt = sizePt, color = color, font = null)
+    clear: List<DocRunProperty> = emptyList(),
+) = DocRunFormat(
+    bold = bold, italic = italic, underline = underline, strike = strike, sizePt = sizePt, color = color, font = null, clear = clear,
+)
+
+/** Direct character formatting removed: the text takes its paragraph and character styles' look again. */
+internal fun clearFormat() = runFormat(clear = DocRunProperty.entries.toList())
 
 /** The generic family that stands in for a document font on the phone. */
 internal enum class WordFont { Sans, Serif, Mono }

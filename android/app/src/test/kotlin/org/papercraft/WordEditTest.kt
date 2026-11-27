@@ -9,6 +9,7 @@ import org.papercraft.core.DocAlign
 import org.papercraft.core.DocBlock
 import org.papercraft.core.DocParagraph
 import org.papercraft.core.DocRun
+import org.papercraft.core.DocRunProperty
 import org.papercraft.core.DocTableCell
 import org.papercraft.core.DocTableRow
 
@@ -208,6 +209,13 @@ class WordEditTest {
         assertEquals(WordFont.Mono, wordFont("Courier New"))
         assertEquals(WordFont.Sans, wordFont("Calibri"))
         assertEquals(WordFont.Sans, wordFont(null))
+    }
+
+    @Test fun clearFormattingClearsEveryPropertyAndSetsNone() {
+        val f = clearFormat()
+        assertEquals(DocRunProperty.entries.toSet(), f.clear.toSet())
+        assertEquals(listOf(null, null, null, null, null, null, null), listOf(f.bold, f.italic, f.underline, f.strike, f.sizePt, f.color, f.font))
+        assertTrue(runFormat(bold = true).clear.isEmpty())
     }
 
     @Test fun coloursParseAsOpaqueArgb() {

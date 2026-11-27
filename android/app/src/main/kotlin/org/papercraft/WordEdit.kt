@@ -621,6 +621,7 @@ private fun FormatControls(s: WordSession, p: WordPara) {
     ColorMenu { s.format(runFormat(color = it)) }
     AlignMenu(p.align, s::align)
     StyleMenu(s.styles, p.styleName, s::style)
+    TextButton({ s.format(clearFormat()) }) { Text("Clear formatting") }
     TextButton(s::pageBreak) { Text("Page break") }
     TextButton(s::done) { Text("Done") }
 }
