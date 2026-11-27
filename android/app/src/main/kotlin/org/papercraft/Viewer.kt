@@ -81,6 +81,9 @@ import java.io.FileNotFoundException
 fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
     val context = LocalContext.current
     val viewer = viewerOf(file.ext)
+    val editor = editorOf(file.ext)
+    var editing by rememberSaveable { mutableStateOf(false) }
+    if (editing && editor != null) return editor.screen(file, false) { editing = false }
     var status by remember { mutableStateOf<String?>(null) }
     var chrome by rememberSaveable { mutableStateOf(true) }
     val scope = rememberCoroutineScope()
@@ -126,7 +129,7 @@ fun ViewerScreen(file: DocFile, onBack: () -> Unit) {
                 enter = slideInVertically(tween(220)) { -it } + fadeIn(tween(180)),
                 exit = slideOutVertically(tween(200)) { -it } + fadeOut(tween(150)),
             ) {
-                ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility)
+                ViewerTopBar(file, status, onBack, scroll = null, windowInsets = WindowInsets.statusBarsIgnoringVisibility, onEdit = editor?.let { { editing = true } })
             }
         }
     } else {
@@ -167,7 +170,7 @@ private fun SystemBarsVisible(visible: Boolean) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets) {
+private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scroll: TopAppBarScrollBehavior?, windowInsets: WindowInsets, onEdit: (() -> Unit)? = null) {
     val context = LocalContext.current
     var menu by remember { mutableStateOf(false) }
     TopAppBar(
@@ -182,6 +185,7 @@ private fun ViewerTopBar(file: DocFile, status: String?, onBack: () -> Unit, scr
         },
         navigationIcon = { IconButton(onBack) { Icon(painterResource(R.drawable.ic_back), "Back") } },
         actions = {
+            onEdit?.let { IconButton(it) { Icon(painterResource(R.drawable.ic_edit), "Edit") } }
             IconButton({ share(context, file.uri) }) { Icon(painterResource(R.drawable.ic_share), "Share") }
             Box {
                 IconButton({ menu = true }) { Icon(painterResource(R.drawable.ic_more), "More options") }
@@ -229,7 +233,7 @@ private fun <T : Any> Loaded(file: DocFile, load: Context.() -> T, release: (T) 
     content(r.getOrElse { return CantOpen(file, friendlyError(it)) })
 }
 
-private fun friendlyError(t: Throwable): String = when (t) {
+internal fun friendlyError(t: Throwable): String = when (t) {
     is FileNotFoundException, is SecurityException ->
         "Papercraft can't reach this file anymore. It may have been moved or deleted."
     is TooBigException, is OutOfMemoryError -> "This file is too big to open for now."
