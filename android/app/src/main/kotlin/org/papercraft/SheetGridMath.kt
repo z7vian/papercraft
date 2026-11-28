@@ -305,6 +305,17 @@ class GridViewport(
     val bodyCols = cols.visible(this.frozenCols, scrollX, ((width - bodyX) / scale).toDouble())
     val bodyRows = rows.visible(this.frozenRows, scrollY, ((height - bodyY) / scale).toDouble())
 
+    /** Whether the sheet-pixel box [left]..[right] x [top]..[bottom] shows in any pane. */
+    fun shows(left: Double, top: Double, right: Double, bottom: Double): Boolean {
+        val frozenX = cols.start(frozenCols)
+        val frozenY = rows.start(frozenRows)
+        val bodyLeft = frozenX + scrollX
+        val bodyTop = frozenY + scrollY
+        val inX = left < frozenX || (right > bodyLeft && left < bodyLeft + (width - bodyX) / scale)
+        val inY = top < frozenY || (bottom > bodyTop && top < bodyTop + (height - bodyY) / scale)
+        return inX && inY
+    }
+
     /** Furthest horizontal scroll that still shows column [count] - 1 at the right edge. */
     fun maxScrollX(count: Int): Double =
         max(0.0, cols.start(max(count, frozenCols)) - cols.start(frozenCols) - (width - bodyX) / scale)

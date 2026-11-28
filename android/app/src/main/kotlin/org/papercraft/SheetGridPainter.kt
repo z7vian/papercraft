@@ -3,6 +3,8 @@ package org.papercraft
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
 import android.text.TextPaint
 import org.papercraft.core.SheetBorder
 import org.papercraft.core.SheetHAlign
@@ -31,13 +33,15 @@ private val HASHES = "#".repeat(256)
 
 /**
  * Draws a sheet onto an Android canvas: frozen panes, the scrolling body and the headers. Cells draw
- * in sheet pixels under the canvas's scale, so zooming re-lays out nothing. Main thread only.
+ * in sheet pixels under the canvas's scale, so zooming re-lays out nothing. [drawings], when given,
+ * paints the sheet's pictures and charts over the cells. Main thread only.
  */
 internal class GridPainter(
     private val sheet: GridSheet,
     private val cells: GridCells,
     private val colors: GridColors,
     private val headerTextPx: Float,
+    private val drawings: GridDrawings? = null,
 ) {
     private val fill = Paint().apply { style = Paint.Style.FILL }
     private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
@@ -48,6 +52,9 @@ internal class GridPainter(
     private val label = CharArray(12)
     private val merges = ArrayList<GridRect>()
     private val dashes = HashMap<SheetLineStyle, DashPathEffect>()
+    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+    private val src = Rect()
+    private val dst = RectF()
 
     // The region being drawn: its sheet-pixel origin and the screen scale.
     private var ox = 0.0
@@ -117,7 +124,46 @@ internal class GridPainter(
         for (m in merges) cells.cell(m.firstRow, m.firstCol)?.let { text(c, it, colLo, colHi) }
         forCells(rows, colLo, colHi) { cell -> if (cell.merge == null) text(c, cell, colLo, colHi) }
         forCells(rows, cols.first, cols.last) { cell -> borders(c, cell) }
+        drawings?.let { pictures(c, it, ((right - left) / scale).toDouble(), ((bottom - top) / scale).toDouble()) }
         c.restore()
+    }
+
+    /** The pictures and charts reaching into the pane [paneW] x [paneH] sheet pixels from the origin, bottom one first. */
+    private fun pictures(c: Canvas, all: GridDrawings, paneW: Double, paneH: Double) {
+        for (d in sheet.drawings) {
+            if (d.right <= ox || d.left >= ox + paneW || d.bottom <= oy || d.top >= oy + paneH) continue
+            val l = (d.left - ox).toFloat()
+            val t = (d.top - oy).toFloat()
+            val r = (d.right - ox).toFloat()
+            val b = (d.bottom - oy).toFloat()
+            val bitmap = all.bitmap(d.index)
+            if (bitmap == null) {
+                // Still loading, or nothing Android can show: a frame where it goes.
+                line.pathEffect = null
+                line.color = colors.gridline
+                line.strokeWidth = 0f
+                c.drawRect(l, t, r, b, line)
+                continue
+            }
+            // The crop's share of the image, kept inside the bitmap; a negative inset pads the box instead.
+            val w = bitmap.width.toFloat()
+            val h = bitmap.height.toFloat()
+            val sl = d.crop.left * w
+            val st = d.crop.top * h
+            val sr = w - d.crop.right * w
+            val sb = h - d.crop.bottom * h
+            if (sr <= sl || sb <= st) continue
+            val cl = sl.coerceIn(0f, w)
+            val ct = st.coerceIn(0f, h)
+            val cr = sr.coerceIn(0f, w)
+            val cb = sb.coerceIn(0f, h)
+            if (cr <= cl || cb <= ct) continue
+            val kx = (r - l) / (sr - sl)
+            val ky = (b - t) / (sb - st)
+            src.set(cl.toInt(), ct.toInt(), cr.toInt(), cb.toInt())
+            dst.set(l + (cl - sl) * kx, t + (ct - st) * ky, r - (sr - cr) * kx, b - (sb - cb) * ky)
+            c.drawBitmap(bitmap, src, dst, bitmapPaint)
+        }
     }
 
     private inline fun forCells(rows: IntRange, colLo: Int, colHi: Int, each: (GridCellDraw) -> Unit) {

@@ -93,23 +93,21 @@ class SaveService(private val context: Context) {
 
     /**
      * Saves [bytes] over [file]. Returns [file] with its new version stamp: use it for the next save.
+     * [draft] is false when the draft store already holds these bytes (the editor's idle draft of this revision).
      * Limit: cloud providers that update last-modified after the upload finishes make the next save see an outside change; lift it by keeping the provider's post-upload stamp (re-query after DocumentsContract notifies the URI).
      */
     @Throws(SaveException::class)
-    fun save(file: DocFile, bytes: ByteArray, overwrite: Boolean = false): DocFile {
+    fun save(file: DocFile, bytes: ByteArray, overwrite: Boolean = false, draft: Boolean = true): DocFile {
         val target = saveTargetOf(file.ext) ?: throw SaveException.Unsupported(file.ext)
         if (!target.inPlace) throw SaveException.NeedsSaveAs(target)
         if (!file.writable) throw SaveException.ReadOnly()
         // A full app storage must not stop the user from saving to the real file.
-        runCatching { drafts.put(file, bytes) }
+        if (draft) runCatching { drafts.put(file, bytes) }
         val now = current(file.uri)
-        val ours = if (!overwrite && changedOnDisk(file.stamp, now)) stillOurs(file.uri) else null
-        android.util.Log.i("PcSave", "save ${file.uri} opened=${file.stamp} now=$now ours=$ours known=${written.containsKey(file.uri)} keys=${written.keys}")
-        if (ours == false) throw SaveException.ChangedOnDisk(file.stamp, now)
+        if (!overwrite && changedOnDisk(file.stamp, now) && !stillOurs(file.uri)) throw SaveException.ChangedOnDisk(file.stamp, now)
         val after = write(file.uri, bytes)
         written[file.uri] = sha256(bytes)
         drafts.discard(file.uri)
-        android.util.Log.i("PcSave", "wrote ${bytes.size} after=$after")
         return file.copy(size = after.size, modified = after.modified)
     }
 
@@ -134,8 +132,8 @@ class SaveService(private val context: Context) {
      */
     private fun stillOurs(uri: Uri): Boolean {
         val mine = written[uri] ?: return false
-        val read = runCatching { context.contentResolver.openInputStream(uri)?.use { it.readBytes() } }
-        android.util.Log.i("PcSave", "readback ${read.exceptionOrNull()} size=${read.getOrNull()?.size}")
+        // A file past the read cap can't be compared; the user then confirms the overwrite.
+        val read = runCatching { context.readBytes(uri) }
         return read.getOrNull()?.let { sha256(it) }?.contentEquals(mine) == true
     }
 

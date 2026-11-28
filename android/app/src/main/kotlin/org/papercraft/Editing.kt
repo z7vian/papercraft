@@ -368,7 +368,7 @@ private class EditShellState<D : EditableDoc>(
             try {
                 val (rev, bytes) = withContext(engine) { e.state.revision to e.doc.save() }
                 val saved = withContext(NonCancellable + Dispatchers.IO) {
-                    files.withLock { saver.save(t, bytes, overwrite).also { e.state.saved(rev) } }
+                    files.withLock { saver.save(t, bytes, overwrite, draft = e.state.needsDraft(rev)).also { e.state.saved(rev) } }
                 }
                 saved(e, saved)
             } catch (x: CancellationException) {

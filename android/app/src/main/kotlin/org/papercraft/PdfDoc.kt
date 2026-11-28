@@ -9,7 +9,6 @@ import kotlinx.coroutines.withContext
 import org.papercraft.core.CoreException
 import org.papercraft.core.PdfFile
 import org.papercraft.core.PdfPageSize
-import java.io.FileNotFoundException
 import java.nio.ByteBuffer
 
 /** The PDF is locked: ask for its password and call [PdfDoc.open] again. [wrongPassword] is true when the one given didn't fit. */
@@ -49,9 +48,9 @@ class PdfDoc private constructor(private val file: PdfFile) : Pages {
     override fun closeLater() = file.close()
 
     companion object {
-        /** Blocking: reads the whole file. Throws [PasswordProtectedException] when [password] is missing or wrong. */
+        /** Blocking: reads the whole file, up to [readBytes]'s cap. Throws [PasswordProtectedException] when [password] is missing or wrong. */
         fun open(context: Context, uri: Uri, password: String? = null): PdfDoc {
-            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: throw FileNotFoundException()
+            val bytes = context.readBytes(uri)
             return try {
                 PdfDoc(PdfFile.open(bytes, password))
             } catch (e: CoreException.PasswordRequired) {

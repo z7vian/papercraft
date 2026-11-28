@@ -251,6 +251,8 @@ private fun GridPane(
     val scheme = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
     val cells = remember(grid) { GridCells(book, grid) }
+    // Charts draw at one bitmap pixel per screen pixel at 100%.
+    val drawings = remember(grid) { GridDrawings(book, grid, density.density) }
     val headerTextPx = with(density) { 12.sp.toPx() }
     val headerH = max(with(density) { 24.dp.toPx() }, headerTextPx * 1.8f)
     val headerW = remember(grid, headerTextPx) {
@@ -272,6 +274,7 @@ private fun GridPane(
                 frozenLine = scheme.outline.toArgb(),
             ),
             headerTextPx,
+            drawings,
         )
     }
     val start = remember(grid) { scrolls[grid.index] ?: GridScroll(0.0, 0.0) }
@@ -325,6 +328,17 @@ private fun GridPane(
         snapshotFlow { if (area == IntSize.Zero) emptySet() else neededBlocks(viewport(), grid) }
             .distinctUntilChanged()
             .collectLatest { cells.load(it) }
+    }
+
+    if (grid.drawings.isNotEmpty()) {
+        LaunchedEffect(drawings) {
+            snapshotFlow {
+                if (area == IntSize.Zero) emptyList()
+                else viewport().let { v -> grid.drawings.filter { v.shows(it.left, it.top, it.right, it.bottom) }.map { it.index } }
+            }
+                .distinctUntilChanged()
+                .collectLatest { drawings.load(it) }
+        }
     }
 
     LaunchedEffect(jump, area) {
@@ -442,6 +456,7 @@ private fun GridPane(
             },
     ) {
         cells.version // redraw as blocks arrive
+        drawings.version // and as pictures do
         val v = viewport()
         drawIntoCanvas { painter.draw(it.nativeCanvas, v) }
         for (hit in found) {

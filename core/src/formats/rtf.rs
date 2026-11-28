@@ -82,6 +82,9 @@ const SKIPPED: &[&str] = &[
     "ftnsep", "ftnsepc", "ftncn", "aftnsep", "aftnsepc", "aftncn", "txe", "xe", "tc", "nonshppict", "private",
 ];
 
+/// Deepest group nesting read.
+const MAX_DEPTH: usize = 4096;
+
 impl Parser {
     fn run(&mut self, rtf: &[u8]) {
         let mut i = 0;
@@ -90,6 +93,11 @@ impl Parser {
             i += 1;
             match b {
                 b'{' => {
+                    // Each open group keeps a saved state; a file of nothing but `{` would need 32 bytes per byte.
+                    // Limit: text past MAX_DEPTH nested groups is dropped; no real document nests that deep.
+                    if self.stack.len() >= MAX_DEPTH {
+                        return;
+                    }
                     self.flush();
                     self.skip = 0;
                     self.stack.push(self.group);
@@ -388,5 +396,12 @@ mod tests {
         let rtf = br"{\rtf1\ansi {\trowd a\cell b\cell\row}\pard after\par}".to_vec();
         assert_eq!(parse_rtf(rtf).unwrap(), ["a\tb", "after"]);
         assert!(parse_rtf(b"plain text".to_vec()).is_err());
+    }
+
+    #[test]
+    fn absurd_nesting_keeps_the_text_before_it() {
+        let mut rtf = br"{\rtf1 kept\par".to_vec();
+        rtf.extend(std::iter::repeat_n(b'{', 1_000_000));
+        assert_eq!(parse_rtf(rtf).unwrap(), ["kept"]);
     }
 }

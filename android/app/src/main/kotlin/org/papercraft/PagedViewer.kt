@@ -18,7 +18,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,7 +58,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -81,7 +80,11 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.ceil
+
+/** Where a zoom step wants the view: scroll [x], scroll the list by [dy], once the content is [width] px wide. */
+private class ZoomAnchor(val x: Float, val dy: Float, val width: Int)
 
 /** A file shown as a column of drawn pages: PDF pages, document pages, slides or sheets. */
 interface Pages {
@@ -151,6 +154,19 @@ fun PagedViewer(
             hScroll.animateScrollTo(left.toInt().coerceIn(0, hScroll.maxValue))
         }
 
+        val screenPx = with(density) { screenWidth.roundToPx() }
+        // Pending scroll of the zoom steps since the last layout. Scrolling before the wider content is laid out
+        // clamps to the old width, which pinned the left edge instead of the point under the fingers.
+        var anchor by remember { mutableStateOf<ZoomAnchor?>(null) }
+        LaunchedEffect(screenPx) {
+            snapshotFlow { anchor to hScroll.maxValue }.collect { (a, max) ->
+                if (a == null || abs(max + screenPx - a.width) > 2) return@collect
+                hScroll.dispatchRawDelta(a.x - hScroll.value)
+                list.dispatchRawDelta(a.dy)
+                anchor = null
+            }
+        }
+
         // Scales around [centroid], so the point under the fingers stays put.
         fun zoomBy(factor: Float, centroid: Offset) {
             val old = zoom
@@ -158,14 +174,15 @@ fun PagedViewer(
             if (new == old) return
             zoom = new
             val f = new / old
-            val dx = (hScroll.value + centroid.x) * (f - 1)
-            val dy = (list.firstVisibleItemScrollOffset + centroid.y) * (f - 1)
-            // The content is only wider and taller after the next layout, so scroll once it exists.
-            scope.launch {
-                withFrameNanos { }
-                hScroll.scrollBy(dx)
-                list.scrollBy(dy)
-            }
+            // Steps that arrive before the next layout build on the pending anchor, not the stale scroll.
+            val pending = anchor
+            val x = pending?.x ?: hScroll.value.toFloat()
+            val dy = pending?.dy ?: 0f
+            anchor = ZoomAnchor(
+                x = ((x + centroid.x) * f - centroid.x).coerceAtLeast(0f),
+                dy = dy + (list.firstVisibleItemScrollOffset + dy + centroid.y) * (f - 1),
+                width = with(density) { (screenWidth * new).roundToPx() },
+            )
         }
 
         fun animateZoomTo(target: Float, centroid: Offset) = scope.launch {

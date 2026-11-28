@@ -1,6 +1,8 @@
 package org.papercraft
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
@@ -16,6 +18,8 @@ import org.papercraft.core.OfficeFamily
 import org.papercraft.core.SheetCell
 import org.papercraft.core.SheetCellStyle
 import org.papercraft.core.SheetDoc
+import org.papercraft.core.SheetCrop
+import org.papercraft.core.SheetDrawingKind
 import org.papercraft.core.SheetHAlign
 import org.papercraft.core.SheetHyperlink
 import org.papercraft.core.SheetLayout
@@ -24,6 +28,7 @@ import org.papercraft.core.SheetTab
 import org.papercraft.core.SheetVAlign
 import org.papercraft.core.SheetValueKind
 import kotlin.math.ceil
+import kotlin.math.max
 
 /** A workbook opened for the cell grid. Sheets load on first use and stay loaded. */
 class SheetGridBook private constructor(private val doc: SheetDoc) {
@@ -47,6 +52,21 @@ class SheetGridBook private constructor(private val doc: SheetDoc) {
     fun findCells(index: Int, query: String, limit: Int): List<Pair<Int, Int>> =
         doc.findCells(index.toUInt(), query, limit.toUInt()).map { it.row.toInt() to it.col.toInt() }
 
+    /**
+     * Blocking: drawing [index] of [sheet] as a bitmap at most [GRID_DRAWING_MAX_PX] a side, charts drawn at
+     * [scale] bitmap pixels per sheet pixel. Null when the core has no image for it or it can't be decoded.
+     */
+    // Limit: pictures Android can't decode (EMF, WMF, SVG, TIFF) show as an empty frame; converting them in the core lifts it.
+    internal fun drawingBitmap(sheet: GridSheet, index: Int, scale: Float): Bitmap? {
+        val bytes = doc.drawingImage(sheet.index.toUInt(), index.toUInt(), scale) ?: return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (max(bounds.outWidth, bounds.outHeight) / sample > GRID_DRAWING_MAX_PX) sample *= 2
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
+    }
+
     /** Frees the file; calls still running finish first. */
     fun close() = doc.close()
 
@@ -62,7 +82,7 @@ class SheetGridBook private constructor(private val doc: SheetDoc) {
     }
 }
 
-/** One sheet's shape: track sizes, frozen panes, merges and links. */
+/** One sheet's shape: track sizes, frozen panes, merges, links, pictures and charts. */
 class GridSheet private constructor(
     val index: Int,
     val layout: SheetLayout,
@@ -70,24 +90,78 @@ class GridSheet private constructor(
     val rows: GridAxis,
     val merges: GridMerges,
     val links: List<SheetHyperlink>,
+    internal val drawings: List<GridDrawing>,
 ) {
-    /** Tracks the grid scrolls over: the used range, and the frozen panes even when blank. */
-    val rowCount = maxOf(layout.rowCount.toInt(), layout.frozenRows.toInt())
-    val colCount = maxOf(layout.colCount.toInt(), layout.frozenCols.toInt())
+    /** Tracks the grid scrolls over: the used range, the frozen panes even when blank, and the drawings. */
+    val rowCount = maxOf(layout.rowCount.toInt(), layout.frozenRows.toInt(), drawings.maxOfOrNull { it.lastRow + 1 } ?: 0)
+    val colCount = maxOf(layout.colCount.toInt(), layout.frozenCols.toInt(), drawings.maxOfOrNull { it.lastCol + 1 } ?: 0)
 
     companion object {
         fun load(doc: SheetDoc, index: Int): GridSheet {
             val sheet = index.toUInt()
             val layout = doc.layout(sheet)
             fun runs(list: List<SheetSizeRun>) = list.map { GridRun(it.first.toInt(), it.last.toInt(), it.px) }
+            val cols = GridAxis(layout.defaultColWidthPx, runs(doc.colWidths(sheet)))
+            val rows = GridAxis(layout.defaultRowHeightPx, runs(doc.rowHeights(sheet)))
+            val drawings = doc.drawings(sheet).mapIndexed { at, d ->
+                GridDrawing(
+                    at, d.kind == SheetDrawingKind.CHART,
+                    cols.start(d.from.col.toInt()) + d.from.colOffPx, rows.start(d.from.row.toInt()) + d.from.rowOffPx,
+                    cols.start(d.to.col.toInt()) + d.to.colOffPx, rows.start(d.to.row.toInt()) + d.to.rowOffPx,
+                    d.to.row.toInt(), d.to.col.toInt(), d.crop, d.label,
+                )
+            }
             return GridSheet(
                 index,
                 layout,
-                GridAxis(layout.defaultColWidthPx, runs(doc.colWidths(sheet))),
-                GridAxis(layout.defaultRowHeightPx, runs(doc.rowHeights(sheet))),
+                cols,
+                rows,
                 GridMerges(doc.merges(sheet).map { GridRect(it.firstRow.toInt(), it.firstCol.toInt(), it.lastRow.toInt(), it.lastCol.toInt()) }),
                 doc.hyperlinks(sheet),
+                drawings,
             )
+        }
+    }
+}
+
+/** The longest side a drawing's bitmap is decoded at. */
+internal const val GRID_DRAWING_MAX_PX = 2048
+
+/**
+ * A picture or chart over the cells: [index] in the core's list, its box in sheet pixels, the last row and
+ * column it reaches, and the share of its image cut from each side.
+ */
+internal class GridDrawing(
+    val index: Int,
+    val chart: Boolean,
+    val left: Double,
+    val top: Double,
+    val right: Double,
+    val bottom: Double,
+    val lastRow: Int,
+    val lastCol: Int,
+    val crop: SheetCrop,
+    val label: String?,
+)
+
+/**
+ * The bitmaps of one sheet's drawings, loaded off the main thread as they come into view and kept while the
+ * sheet shows. Only the main thread touches the cache; [version] changes whenever one arrives.
+ */
+internal class GridDrawings(private val book: SheetGridBook, private val sheet: GridSheet, private val chartScale: Float) {
+    /** A null value: the drawing has no image Android can show. */
+    private val bitmaps = HashMap<Int, Bitmap?>()
+    var version by mutableIntStateOf(0)
+        private set
+
+    fun bitmap(index: Int): Bitmap? = bitmaps[index]
+
+    /** Loads the drawings not loaded yet, one at a time. */
+    suspend fun load(indices: Collection<Int>) {
+        for (index in indices) {
+            if (index in bitmaps) continue
+            bitmaps[index] = withContext(Dispatchers.IO) { runCatching { book.drawingBitmap(sheet, index, chartScale) }.getOrNull() }
+            version++
         }
     }
 }

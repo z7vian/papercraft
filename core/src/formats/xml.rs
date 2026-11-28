@@ -96,7 +96,8 @@ fn pretty(xml: &str) -> Option<Vec<String>> {
             Event::PI(p) => toks.push(Tok::Line(format!("<?{}?>", s(&p)))),
             Event::DocType(d) => toks.push(Tok::Line(format!("<!DOCTYPE {}>", s(&d).trim()))),
             Event::Eof => break,
-            Event::Text(_) | Event::GeneralRef(_) | Event::CData(_) => unreachable!("handled above"),
+            // Character data `continue`d in the match above.
+            Event::Text(_) | Event::GeneralRef(_) | Event::CData(_) => {}
         }
     }
     // Unclosed elements, or no markup at all (plain text saved as .xml): show the file as it is.

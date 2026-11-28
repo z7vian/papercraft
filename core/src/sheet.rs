@@ -1,13 +1,13 @@
-//! Spreadsheets as a cell grid: the cells, sizes, merges and links a spreadsheet screen draws.
-//! (`office/xlsx.rs` still draws whole sheets as pictures for `OfficeDoc`.)
+//! Spreadsheets as a cell grid: the cells, sizes, merges, links, pictures and charts a spreadsheet
+//! screen draws. (`office/xlsx.rs` still draws whole sheets as pictures for `OfficeDoc`.)
 //!
 //! Opening skips the editing workbook (`betteroffice_xlsx::Workbook`) and calls the engine's
 //! parser directly: it inflates only the parts a grid reads, parses one sheet at a time, and reads
-//! merged ranges in linear time. Pictures, charts, comments and formula recalculation are not here.
+//! merged ranges in linear time. Pictures and charts are read from the kept package when the grid
+//! asks for them (`sheet_drawings.rs`). Comments and formula recalculation are not here.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 
 use betteroffice_xlsx::GridGeometry;
@@ -28,6 +28,9 @@ use crate::office::{OfficeFamily, convert};
 
 #[path = "sheet_find.rs"]
 mod find;
+
+#[path = "sheet_drawings.rs"]
+mod drawings;
 
 /// Parsing recurses on nested content, as in `office/mod.rs`; Kotlin's calling threads have small stacks.
 const ENGINE_STACK: usize = 32 * 1024 * 1024;
@@ -224,7 +227,9 @@ pub struct SheetCell {
 pub struct SheetDoc {
     tabs: Vec<SheetTab>,
     active: u32,
-    book: Mutex<Book>,
+    /// Readers share it; only parsing a sheet takes it alone, so a long search doesn't stall the grid.
+    book: RwLock<Book>,
+    chart_fonts: drawings::ChartFonts,
 }
 
 #[uniffi::export]
@@ -248,7 +253,7 @@ impl SheetDoc {
             .map(|(index, name)| SheetTab { hidden: listed && entries[index].hidden, name })
             .collect::<Vec<_>>();
         let active = active.min(tabs.len().saturating_sub(1)) as u32;
-        Ok(Arc::new(Self { tabs, active, book: Mutex::new(book) }))
+        Ok(Arc::new(Self { tabs, active, book: RwLock::new(book), chart_fonts: Default::default() }))
     }
 
     pub fn sheets(&self) -> Vec<SheetTab> {
@@ -351,15 +356,23 @@ impl SheetDoc {
 
 impl SheetDoc {
     fn with<T>(&self, sheet: u32, read: impl FnOnce(&Book, &Loaded) -> T) -> Result<T, CoreError> {
-        let mut book = self.book.lock().map_err(|_| stopped())?;
         let index = sheet as usize;
-        if index >= book.slots.len() {
-            return Err(CoreError::BadFile(format!("This workbook has no sheet {}.", sheet + 1)));
+        let missing = || CoreError::BadFile(format!("This workbook has no sheet {}.", sheet + 1));
+        {
+            let book = self.book.read().map_err(|_| stopped())?;
+            let slot = book.slots.get(index).ok_or_else(missing)?;
+            if let Some(loaded) = &slot.loaded {
+                return Ok(read(&book, loaded));
+            }
         }
-        if book.slots[index].loaded.is_none() {
-            book.parse(index)?;
+        {
+            let mut book = self.book.write().map_err(|_| stopped())?;
+            if book.slots.get(index).ok_or_else(missing)?.loaded.is_none() {
+                book.parse(index)?;
+            }
         }
-        let loaded = book.slots[index].loaded.as_ref().ok_or_else(stopped)?;
+        let book = self.book.read().map_err(|_| stopped())?;
+        let loaded = book.slots.get(index).and_then(|slot| slot.loaded.as_ref()).ok_or_else(stopped)?;
         Ok(read(&book, loaded))
     }
 }
@@ -367,6 +380,8 @@ impl SheetDoc {
 /// The unpacked file: its parts, one slot per sheet, and what its sheets share.
 struct Book {
     parts: Vec<(String, Vec<u8>)>,
+    /// The whole file, kept compressed when it has drawings, for their pictures and charts.
+    package: Option<ooxml_opc::RetainedPackage>,
     slots: Vec<Slot>,
     /// The shared strings, styles and date system the first parse reads. Their parts leave
     /// [`Book::parts`] then, so later sheets parse without reading them again.
@@ -376,7 +391,7 @@ struct Book {
     workbook_read: bool,
     dates: ShortDate,
     /// Loaded when a cell is first measured.
-    fonts: RefCell<Option<Fonts>>,
+    fonts: Mutex<Option<Fonts>>,
     /// Parses the shared strings part was given to.
     #[cfg(test)]
     string_reads: usize,
@@ -386,6 +401,8 @@ struct Slot {
     /// The sheet's worksheet part in [`Book::parts`], when the workbook names it unambiguously.
     /// Such a part holds [`BLANK_WORKSHEET`] while `xml` keeps the real one until the sheet parses.
     part: Option<usize>,
+    /// The worksheet part's path, when the workbook names one.
+    path: Option<String>,
     xml: Option<Vec<u8>>,
     loaded: Option<Loaded>,
 }
@@ -415,25 +432,36 @@ impl Book {
     /// sheet entries and its active tab.
     fn unpack(bytes: Vec<u8>) -> Result<(Self, Vec<Entry>, usize), CoreError> {
         let bytes = if bytes.starts_with(b"PK") { bytes } else { convert::to_ooxml(bytes, OfficeFamily::Spreadsheet)? };
-        let mut parts = ooxml_opc::unzip_parts_where(&bytes, u64::MAX, keep_part).map_err(bad)?;
-        drop(bytes);
+        let drawn = std::cell::Cell::new(false);
+        let mut parts = ooxml_opc::unzip_parts_where(&bytes, u64::MAX, |name| {
+            if name.trim_start_matches('/').to_ascii_lowercase().starts_with("xl/drawings/") {
+                drawn.set(true);
+            }
+            keep_part(name)
+        })
+        .map_err(bad)?;
+        // Only a file with drawings stays in memory, for the pictures and charts they show.
+        let package = if drawn.get() { ooxml_opc::RetainedPackage::from_bytes(bytes.into()).ok() } else { None };
         let (entries, active) = find(&parts, "xl/workbook.xml").and_then(workbook_entries).unwrap_or_default();
         let rels = find(&parts, "xl/_rels/workbook.xml.rels").and_then(relationships).unwrap_or_default();
-        // Mirrors how the engine's parser finds each sheet's part.
-        let mut targets: Vec<Option<usize>> = entries
+        // Mirrors how the engine's parser finds each sheet's part. A chart sheet's part only shows drawings.
+        let paths: Vec<(Option<String>, bool)> = entries
             .iter()
             .enumerate()
             .map(|(index, entry)| {
                 let rel = entry.rid.as_deref().and_then(|rid| rels.get(rid));
-                if rel.is_some_and(|rel| !rel.is_worksheet()) {
-                    return None;
-                }
-                let path = rel
-                    .filter(|rel| !rel.external)
-                    .map(|rel| resolve_part_path("xl", &rel.target))
-                    .unwrap_or_else(|| format!("xl/worksheets/sheet{}.xml", index + 1));
-                position(&parts, &path)
+                let worksheet = rel.is_none_or(Relationship::is_worksheet);
+                let path = match rel.filter(|rel| !rel.external) {
+                    Some(rel) => resolve_part_path("xl", &rel.target),
+                    None if worksheet => format!("xl/worksheets/sheet{}.xml", index + 1),
+                    None => return (None, false),
+                };
+                (position(&parts, &path).map(|_| path), worksheet)
             })
+            .collect();
+        let mut targets: Vec<Option<usize>> = paths
+            .iter()
+            .map(|(path, worksheet)| path.as_deref().filter(|_| *worksheet).and_then(|path| position(&parts, path)))
             .collect();
         // A part two sheets share can't be set aside for one of them.
         for index in 0..targets.len() {
@@ -445,21 +473,24 @@ impl Book {
         }
         let slots = targets
             .into_iter()
-            .map(|part| Slot {
+            .zip(paths.into_iter().map(|(path, _)| path))
+            .map(|(part, path)| Slot {
                 part,
+                path,
                 xml: part.map(|part| std::mem::replace(&mut parts[part].1, BLANK_WORKSHEET.to_vec())),
                 loaded: None,
             })
             .collect();
         let book = Self {
             parts,
+            package,
             slots,
             strings: Vec::new(),
             styles: Stylesheet::default(),
             date_system: DateSystem::default(),
             workbook_read: false,
             dates: short_date(None),
-            fonts: RefCell::new(None),
+            fonts: Mutex::new(None),
             #[cfg(test)]
             string_reads: 0,
         };
@@ -512,7 +543,7 @@ impl Book {
                 self.slots.clear();
                 return self.parse(index);
             }
-            self.slots = model.sheets.iter().map(|_| Slot { part: None, xml: None, loaded: None }).collect();
+            self.slots = model.sheets.iter().map(|_| Slot { part: None, path: None, xml: None, loaded: None }).collect();
         }
         // The sheet's own part, read again for its shared strings when an earlier parse read them.
         let xml = self.slots.get_mut(index).and_then(|slot| slot.xml.take());
@@ -798,7 +829,7 @@ impl<'a> Styler<'a> {
         let normal = book.styles.font_for(0).or_else(|| book.styles.fonts.first());
         let family = normal.and_then(|font| font.name.as_deref()).unwrap_or(DEFAULT_FAMILY);
         let size = normal.and_then(|font| font.size_pt).filter(|pt| pt.is_finite() && *pt > 0.0).unwrap_or(11.0) as f32;
-        let mut fonts = book.fonts.borrow_mut();
+        let mut fonts = book.fonts.lock().unwrap_or_else(PoisonError::into_inner);
         let fonts = fonts.get_or_insert_with(Fonts::new);
         let chain = fonts.chain(family, false, false);
         let px = 3.0 * fonts.width(chain, size, " ").round();
@@ -815,7 +846,7 @@ impl<'a> Styler<'a> {
             return font;
         }
         let style = &format.style;
-        let font = fonts.borrow_mut().get_or_insert_with(Fonts::new).chain(
+        let font = fonts.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(Fonts::new).chain(
             style.font_name.as_deref().unwrap_or(DEFAULT_FAMILY),
             style.bold,
             style.italic,
@@ -830,7 +861,7 @@ impl<'a> Styler<'a> {
         let font = self.font(xf);
         let size = self.format(xf).style.font_size_pt;
         let book = self.book;
-        let mut fonts = book.fonts.borrow_mut();
+        let mut fonts = book.fonts.lock().unwrap_or_else(PoisonError::into_inner);
         let fonts = &*fonts.get_or_insert_with(Fonts::new);
         let mut measure = |text: &str| fonts.width(font, size, text);
         let FormattedValue { mut text, layout, .. } = shown;
@@ -1756,7 +1787,7 @@ mod tests {
         let second_cell = cell(&doc, 1, "B1");
         assert_eq!((second_cell.kind, second_cell.style.h_align), (SheetValueKind::Text, SheetHAlign::Left));
         assert_eq!(doc.merges(1).unwrap(), vec![range("E1:F1")]);
-        assert_eq!(doc.book.lock().unwrap().string_reads, 1);
+        assert_eq!(doc.book.read().unwrap().string_reads, 1);
     }
 
     /// Before/after open timings on a generated workbook shaped like the slow spike files (many

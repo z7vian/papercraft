@@ -107,8 +107,9 @@ fn ask<T: Send + 'static>(
 /// Pixel size for drawing a page `width` pixels wide, shrunk to fit [`MAX_PIXELS`].
 fn fit(size: PdfPageSize, width: u32) -> (u32, u32) {
     let (pw, ph) = (f64::from(size.width.max(1.0)), f64::from(size.height.max(1.0)));
-    let w = f64::from(width).min((MAX_PIXELS * pw / ph).sqrt()).max(1.0).round();
-    let h = (w * ph / pw).round().max(1.0);
+    let w = f64::from(width).min((MAX_PIXELS * pw / ph).sqrt()).clamp(1.0, MAX_PIXELS).round();
+    // A sliver page (or a broken size) rounded up to one pixel wide must still stay under the cap.
+    let h = (w * ph / pw).round().min((MAX_PIXELS / w).floor()).max(1.0);
     (w as u32, h as u32)
 }
 
@@ -174,6 +175,8 @@ impl PdfFile {
 
     /// Page `index` drawn `width` pixels wide on white (smaller if it would exceed 16 MP), or `None` past the last page.
     /// Pixels are RGBA and opaque, so already premultiplied: ready for `Bitmap.copyPixelsFromBuffer`.
+    // Limit: the pixels are copied three times on the way to a Bitmap (Rust Vec to the FFI buffer, to a Kotlin
+    // ByteArray, to the Bitmap); render into `AndroidBitmap_lockPixels` memory over JNI to draw straight into it.
     pub fn render(&self, index: u32, width: u32) -> Result<Option<RgbaImage>, CoreError> {
         let Some(&size) = self.sizes.get(index as usize) else { return Ok(None) };
         let (w, h) = fit(size, width);
@@ -231,7 +234,7 @@ impl Drop for PdfFile {
 
 #[cfg(test)]
 mod tests {
-    use super::PdfFile;
+    use super::{MAX_PIXELS, PdfFile, PdfPageSize, fit};
     use crate::CoreError;
 
     fn fixture(name: &str) -> Vec<u8> {
@@ -265,6 +268,20 @@ mod tests {
         let pdf = PdfFile::open(fixture("tracemonkey.pdf"), None).unwrap();
         let img = pdf.render(0, 100_000).unwrap().unwrap();
         assert!(u64::from(img.width) * u64::from(img.height) <= 16_000_000);
+    }
+
+    #[test]
+    fn fit_follows_the_width_and_caps_degenerate_pages() {
+        let page = |width, height| PdfPageSize { width, height };
+        assert_eq!(fit(page(612.0, 792.0), 240), (240, 311));
+        assert_eq!(fit(page(612.0, 792.0), 2048), (2048, 2650));
+        for size in [page(1.0, 1e9), page(1e9, 1.0), page(f32::INFINITY, 1.0), page(f32::INFINITY, f32::INFINITY), page(f32::NAN, f32::NAN)]
+        {
+            for width in [0, 1, 2048, u32::MAX] {
+                let (w, h) = fit(size, width);
+                assert!(w >= 1 && h >= 1 && f64::from(w) * f64::from(h) <= MAX_PIXELS, "{:?}", (size.width, size.height, width, w, h));
+            }
+        }
     }
 
     #[test]

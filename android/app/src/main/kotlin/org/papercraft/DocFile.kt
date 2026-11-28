@@ -95,10 +95,38 @@ fun Context.isReachable(uri: Uri): Boolean = runCatching {
 
 class TooBigException : Exception()
 
+/** Default cap for [readBytes]: a quarter of the heap, so the bytes and what is decoded from them still fit. */
+val defaultMaxBytes: Long get() = Runtime.getRuntime().maxMemory() / 4
+
 /** The whole file. Throws [TooBigException] past [maxBytes], before reading when the provider reports the size. Blocking. */
-fun Context.readBytes(file: DocFile, maxBytes: Long = Long.MAX_VALUE): ByteArray {
-    if (file.size > maxBytes) throw TooBigException()
-    val bytes = contentResolver.openInputStream(file.uri)?.use { it.readBytes() } ?: throw FileNotFoundException()
-    if (bytes.size > maxBytes) throw TooBigException()
-    return bytes
+fun Context.readBytes(file: DocFile, maxBytes: Long = defaultMaxBytes): ByteArray = readBytes(file.uri, file.size, maxBytes)
+
+/**
+ * The whole content at [uri]. Throws [TooBigException] past [maxBytes]: before reading when [knownSize] (-1: unknown)
+ * says so, else as soon as the stream passes it, so a provider that lies or doesn't say never fills the heap. Blocking.
+ */
+fun Context.readBytes(uri: Uri, knownSize: Long = -1, maxBytes: Long = defaultMaxBytes): ByteArray {
+    val cap = minOf(maxBytes, Int.MAX_VALUE - 8L) // largest array the VM allocates
+    if (knownSize > cap) throw TooBigException()
+    val stream = contentResolver.openInputStream(uri) ?: throw FileNotFoundException()
+    return stream.use {
+        // Sized right when the provider reports the size, so a correct report reads with no copy.
+        var bytes = ByteArray(if (knownSize >= 0) knownSize.toInt() else minOf(cap, CHUNK).toInt())
+        var len = 0
+        while (true) {
+            if (len == bytes.size) {
+                val next = it.read()
+                if (next < 0) return@use bytes
+                if (len >= cap) throw TooBigException()
+                bytes = bytes.copyOf(minOf(maxOf(len * 2L, CHUNK), cap).toInt())
+                bytes[len++] = next.toByte()
+            }
+            val n = it.read(bytes, len, bytes.size - len)
+            if (n < 0) break
+            len += n
+        }
+        if (len == bytes.size) bytes else bytes.copyOf(len)
+    }
 }
+
+private const val CHUNK = 64L * 1024
